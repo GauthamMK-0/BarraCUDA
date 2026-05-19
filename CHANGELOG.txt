@@ -1,6 +1,17 @@
 BarraCUDA — Changelog
 =====================
 
+2026-05-19 — HIP frontend mode (--hip, plus auto-detect on the .hip
+file extension). HIP source is syntactically a superset of CUDA, so
+no new parser was required; the entire change is one block in main.c
+that predefines __HIPCC__, __HIP_DEVICE_COMPILE__, and the appropriate
+__HIP_PLATFORM_AMD__ or __HIP_PLATFORM_NVIDIA__ macro depending on
+the chosen backend. Downstream of the preprocessor the pipeline is
+identical to a CUDA compile. A .hip kernel now compiles through to
+a working GFX11 .hsaco end to end. Two clearly marked HIP NOTES
+blocks in main.c document exactly where the divergence lives and
+why everything else stays put.
+
 2026-05-19 — Apple Metal and Intel Arc Xe backend stubs (--metal,
 --intel-spirv with --xe-lpg / --xe-hpg / --xe-hpc / --xe2 variants).
 Just a stub for now: the directories exist, the headers declare

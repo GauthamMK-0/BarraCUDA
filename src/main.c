@@ -87,6 +87,8 @@ static void usage(const char *prog)
         "  --max-vgprs N    Cap VGPR count for regalloc (forces spills)\n"
         "  --tensix      Compile to TT-Metalium C++ (Tensix SFPU)\n"
         "  --nvidia-ptx  Compile to NVIDIA PTX (sm_89)\n"
+        "  --hip         HIP frontend mode (predefines __HIPCC__ and platform macros;\n"
+        "                auto-on for .hip files; combine with --amdgpu-bin or --nvidia-ptx)\n"
         "  --metal       Compile to Apple Metal Shading Language (stub)\n"
         "  --intel-spirv Compile to SPIR-V for Intel Arc Xe (stub)\n"
         "  --xe-lpg      Target Xe-LPG (Arc / integrated)\n"
@@ -115,6 +117,7 @@ int main(int argc, char *argv[])
     int mode_nvidia = 0;
     int mode_metal = 0;
     int mode_intel = 0;
+    int mode_hip = 0;           /* HIP frontend: see HIP NOTES below */
     intel_target_t intel_target = INTEL_TARGET_XE_HPG;
     int nv_bkhit = 0;
     int no_mem2reg = 0;
@@ -210,6 +213,8 @@ int main(int argc, char *argv[])
             intel_target = INTEL_TARGET_XE_HPC;
         else if (strcmp(argv[i], "--xe2") == 0)
             intel_target = INTEL_TARGET_XE2;
+        else if (strcmp(argv[i], "--hip") == 0)
+            mode_hip = 1;
         else if (strcmp(argv[i], "--bkhit") == 0)
             nv_bkhit = 1;
         else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc)
@@ -266,6 +271,27 @@ int main(int argc, char *argv[])
         !mode_metal && !mode_intel)
         mode_parse = 1;
 
+    /* ---- HIP NOTES (1 of 2) -------------------------------------------
+     * HIP is a frontend-only mode, not a separate parser. The HIP source
+     * language is, in practice, a syntactic superset of CUDA: the same
+     * __global__ / __device__ / __shared__ qualifiers, the same
+     * threadIdx / blockIdx / blockDim builtins, and the same arithmetic
+     * happens with the same syntax. What changes when you flip --hip on
+     * is the set of preprocessor macros we predefine, so that any
+     * #if defined(__HIPCC__) or __HIP_PLATFORM_AMD__ guards in the source
+     * pick the HIP branch instead of falling through to whatever the
+     * source thought the default platform was.
+     *
+     * Auto-detection: if the filename ends in ".hip", we assume HIP mode
+     * without making the user say so on the command line, since the
+     * extension is a strong enough signal for anyone using a HIP build
+     * pipeline to drop their files into BarraCUDA unchanged. */
+    if (file) {
+        size_t flen = strlen(file);
+        if (flen >= 4 && strcmp(file + flen - 4, ".hip") == 0)
+            mode_hip = 1;
+    }
+
     /* Load translation file before any diagnostics fire */
     if (lang_file) bc_eload(lang_file);
 
@@ -284,6 +310,35 @@ int main(int argc, char *argv[])
             return 1;
         }
         pp_init(pp, source_buf, src_len, pp_out_buf, BC_MAX_SOURCE, file);
+
+        /* ---- HIP NOTES (2 of 2) ---------------------------------------
+         * This is the only spot in the pipeline that knows or cares
+         * whether we are compiling CUDA or HIP. pp_init has just defined
+         * the CUDA defaults (__BARRACUDA__, __CUDA_ARCH__, __CUDACC__)
+         * unconditionally, which is correct for CUDA and harmless for
+         * HIP because real HIP source files distinguish platforms with
+         * __HIP_PLATFORM_AMD__ versus __HIP_PLATFORM_NVIDIA__ rather
+         * than by the presence or absence of __CUDACC__.
+         *
+         * When --hip is on, we additively define the HIP-specific
+         * macros so that the preprocessor takes the HIP branch wherever
+         * the source asks for it:
+         *   __HIPCC__               compiler identity, "we are a HIP compiler"
+         *   __HIP_DEVICE_COMPILE__  we are compiling device code (always true here)
+         *   __HIP_PLATFORM_AMD__    target is AMD silicon (the common case)
+         *   __HIP_PLATFORM_NVIDIA__ target is NVIDIA via the HIP-on-CUDA path
+         *
+         * Beyond these macros, nothing in the parser, sema, IR, or
+         * backends needs to know about HIP. The pipeline downstream of
+         * here is identical to a CUDA compile. */
+        if (mode_hip) {
+            pp_define(pp, "__HIPCC__", "1");
+            pp_define(pp, "__HIP_DEVICE_COMPILE__", "1");
+            if (mode_nvidia)
+                pp_define(pp, "__HIP_PLATFORM_NVIDIA__", "1");
+            else
+                pp_define(pp, "__HIP_PLATFORM_AMD__", "1");
+        }
 
         for (int i = 0; i < num_include_paths; i++)
             pp_add_include_path(pp, include_paths[i]);
