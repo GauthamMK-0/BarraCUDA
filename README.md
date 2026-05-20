@@ -18,8 +18,6 @@ Takes CUDA C source code, the same `.cu` files you'd feed to `nvcc`, and compile
 # It's C99. It builds with gcc. There are no dependencies.
 make
 
-# That's it. No cmake. No autoconf. No 47-step build process.
-# If this doesn't work, your gcc is broken, not the Makefile.
 ```
 
 ### Requirements
