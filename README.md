@@ -6,7 +6,7 @@ This is what happens when you look at NVIDIA's walled garden and think "how hard
 
 See [CHANGELOG.txt](CHANGELOG.txt) for recent updates.
 
-**update** HIP is now being supported.
+**update**: HIP is now being supported.
 
 ## What It Does
 
