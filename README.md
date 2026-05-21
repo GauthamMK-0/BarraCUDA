@@ -8,6 +8,8 @@ See [CHANGELOG.txt](CHANGELOG.txt) for recent updates.
 
 **update**: HIP is now being supported.
 
+**update 2**: Triton is now being supported as well.
+
 ## What It Does
 
 Takes CUDA C and HIP source code, the same `.cu` or `.hip`  files you'd feed to `nvcc` or `ROCm`, and compiles them to AMD RDNA 2/3/4 binaries, NVIDIA PTX, or Tenstorrent Tensix Metalium C++.
