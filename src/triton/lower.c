@@ -1,35 +1,34 @@
-/* Triton frontend BIR lowering, sitting one.
+/* Triton frontend BIR lowering.
  *
- * Walks the sema-annotated AST and produces BIR, the same target
- * the CUDA frontend lowers into. The point is that once a Triton
- * kernel reaches BIR, every backend (AMD, NVIDIA, Tensix, Metal,
- * Intel) consumes it without caring which Python decorator was
- * sitting at the top of the source file.
+ * Walks the sema-annotated AST and produces BIR, the same target the
+ * CUDA frontend lowers into. The whole point: once a Triton kernel
+ * reaches BIR, every backend (AMD, NVIDIA, Tensix, Metal, Intel, and
+ * now plain x86 CPU) eats it without caring which Python decorator was
+ * sitting at the top of the file.
  *
- * Scope of this sitting:
- *   - Module skeleton: pull each @triton.jit FuncDef into the
- *     module, mark it __global__, generate BIR_PARAM instructions
- *     for each parameter, terminate the entry block with BIR_RET.
- *   - Statements: Assign (lower RHS, remember the BIR value through
- *     the AST node map), ExprStmt (lower expression for its side
- *     effect), Return.
- *   - Expressions: integer and float literals, Name references to
- *     parameters and locals, BinOp arithmetic (add, sub, mul,
- *     integer div, mod), unary negation, Call sites for the small
- *     set of scalar intrinsics this sitting recognises
- *     (tl.program_id, tl.num_programs).
- *   - Unsupported constructs get a polite diagnostic and the
- *     pass continues. For loops, conditionals, subscripts, slices,
- *     masked load/store, tile shapes, reductions, matmul, and the
- *     full intrinsic catalogue all wait their turn for sitting two
- *     and onwards.
+ * This started life as a humble "sitting one" that could barely add two
+ * scalars together. It has since grown teeth. What works now:
+ *   - Module skeleton: each @triton.jit FuncDef becomes a __global__
+ *     function with one BIR_PARAM per parameter and a tidy BIR_RET.
+ *   - Statements: Assign, ExprStmt, Return, AugAssign, and the big one,
+ *     `for k in range(...)` as a real counted loop.
+ *   - Scalar expressions: int/float literals, params and locals, the
+ *     usual BinOp arithmetic, unary negation, comparisons, and the
+ *     scalar intrinsics (program_id, num_programs, arange, cdiv).
+ *   - Tiles: 2-D shapes from [:,None]/[None,:] broadcasts, tl.load,
+ *     tl.store, tl.zeros, and tl.dot. A kernel with rank-2 tiles
+ *     materialises and unrolls them, and a K-loop sweeps an arbitrary
+ *     contraction. Which is to say: a Triton matmul compiles and runs
+ *     on a laptop CPU with no GPU and no LLVM in sight. Woop woop.
  *
- * Type policy for this sitting: pointer parameters are typed as
- * i32* in the global address space, everything else is i32 unless
- * the source is a float literal in which case it is f32. The
- * crude policy is a deliberate sitting-one shortcut; sitting two
- * adds real type inference based on use sites and intrinsic
- * signatures. */
+ * Still on the bench: multi-block grids (one block per call for now),
+ * tl.load mask=, while loops, if/else, and rank-2 reductions. They will
+ * get their turn.
+ *
+ * Type policy is still cheerfully crude: a param whose name ends in
+ * _ptr is f32*, a tl.constexpr param is i32, everything else is i32,
+ * and float literals are f32. Real use-site type inference is a job for
+ * another day. */
 
 #include "triton.h"
 
@@ -360,58 +359,46 @@ static int l_bop_float(int bop)
     }
 }
 
+/* Value-level binop: dispatch ptr+int -> GEP, float -> FADD..., int ->
+ * ADD... Shared by the scalar path (l_binop) and the per-element tile
+ * path so both encode arithmetic identically. */
+static uint32_t l_emit_binop(tn_lower_t *L, int bop, uint32_t lhs, uint32_t rhs)
+{
+    if (lhs == BIR_VAL_NONE || rhs == BIR_VAL_NONE) return BIR_VAL_NONE;
+    uint32_t lt = l_val_type(L, lhs), rt = l_val_type(L, rhs);
+    int lk = l_type_kind(L, lt), rk = l_type_kind(L, rt);
+
+    if (bop == TN_BOP_ADD && (lk == BIR_TYPE_PTR || rk == BIR_TYPE_PTR)) {
+        uint32_t base = (lk == BIR_TYPE_PTR) ? lhs : rhs;
+        uint32_t idx  = (lk == BIR_TYPE_PTR) ? rhs : lhs;
+        uint32_t bt   = (lk == BIR_TYPE_PTR) ? lt  : rt;
+        uint32_t inst = l_emit(L, BIR_GEP, bt, 0);
+        l_op(L, inst, base); l_op(L, inst, idx);
+        return inst;
+    }
+    if (lk == BIR_TYPE_FLOAT || rk == BIR_TYPE_FLOAT) {
+        int op = l_bop_float(bop);
+        if (op < 0) return BIR_VAL_NONE;
+        uint32_t inst = l_emit(L, op, L->t_f32, 0);
+        l_op(L, inst, lhs); l_op(L, inst, rhs);
+        return inst;
+    }
+    int op = l_bop_int(bop);
+    if (op < 0) return BIR_VAL_NONE;
+    uint32_t inst = l_emit(L, op, L->t_i32, 0);
+    l_op(L, inst, lhs); l_op(L, inst, rhs);
+    return inst;
+}
+
 static uint32_t l_binop(tn_lower_t *L, uint32_t node_idx)
 {
     const tn_node_t *n = &L->parser->nodes[node_idx];
     uint32_t lhs = l_expr(L, l_kid(L, node_idx, 0));
     uint32_t rhs = l_expr(L, l_kid(L, node_idx, 1));
-    if (lhs == BIR_VAL_NONE || rhs == BIR_VAL_NONE) return BIR_VAL_NONE;
-
-    uint32_t lhs_type = l_val_type(L, lhs);
-    uint32_t rhs_type = l_val_type(L, rhs);
-    int lkind = l_type_kind(L, lhs_type);
-    int rkind = l_type_kind(L, rhs_type);
-
-    /* Pointer arithmetic: ptr + i32 lowers as a BIR_GEP, the typed
-     * pointer-stride flavour BIR uses for offset addressing. Only
-     * ADD makes sense here; everything else on a pointer is silly. */
-    if (n->flags == TN_BOP_ADD &&
-        (lkind == BIR_TYPE_PTR || rkind == BIR_TYPE_PTR)) {
-        uint32_t base = (lkind == BIR_TYPE_PTR) ? lhs : rhs;
-        uint32_t idx  = (lkind == BIR_TYPE_PTR) ? rhs : lhs;
-        uint32_t base_type = (lkind == BIR_TYPE_PTR) ? lhs_type : rhs_type;
-        uint32_t inst = l_emit(L, BIR_GEP, base_type, 0);
-        l_op(L, inst, base);
-        l_op(L, inst, idx);
-        return inst;
-    }
-
-    /* Float dispatch when either operand is a float; this is a
-     * sitting-two simplification of Python's "promote int to
-     * float in mixed expressions" rule. */
-    if (lkind == BIR_TYPE_FLOAT || rkind == BIR_TYPE_FLOAT) {
-        int op = l_bop_float((int)n->flags);
-        if (op < 0) {
-            l_err(L, 93, l_tok(L, node_idx),
-                  "float binop not yet lowered");
-            return BIR_VAL_NONE;
-        }
-        uint32_t inst = l_emit(L, op, L->t_f32, 0);
-        l_op(L, inst, lhs);
-        l_op(L, inst, rhs);
-        return inst;
-    }
-
-    int op = l_bop_int((int)n->flags);
-    if (op < 0) {
-        l_err(L, 93, l_tok(L, node_idx),
-              "integer binop not yet lowered");
-        return BIR_VAL_NONE;
-    }
-    uint32_t inst = l_emit(L, op, L->t_i32, 0);
-    l_op(L, inst, lhs);
-    l_op(L, inst, rhs);
-    return inst;
+    uint32_t r = l_emit_binop(L, (int)n->flags, lhs, rhs);
+    if (r == BIR_VAL_NONE && lhs != BIR_VAL_NONE && rhs != BIR_VAL_NONE)
+        l_err(L, 93, l_tok(L, node_idx), "binop not yet lowered");
+    return r;
 }
 
 /* Comparison nodes lower to BIR_ICMP or BIR_FCMP with the predicate
@@ -655,6 +642,211 @@ static uint32_t l_intrinsic_call(tn_lower_t *L, uint32_t call_idx,
     }
 }
 
+/* ---- Rank-2 / tile materialisation (the tl.dot path) ----
+ *
+ * The moment a kernel touches a 2-D tile we stop pretending each lane is
+ * a thread and just unroll the lot. Block sizes are compile-time
+ * constants, so a tile is nothing fancier than an array of per-element
+ * BIR values: arange hands back literal indices, [:,None]/[None,:]
+ * reshape, the usual ops fan out with broadcasting, and tl.dot is a flat
+ * sum of products. It all runs on one thread, since nothing in here ever
+ * asks what thread_id is. Tiles are capped at TN_TILE_MAX elements;
+ * past that we bail rather than emit a wall of instructions. */
+
+static int l_tile(tn_lower_t *L, uint32_t node, int *out);
+
+static uint32_t l_const_i32(tn_lower_t *L, int v){
+    return BIR_MAKE_CONST(bir_const_int(L->bir, L->t_i32, (int64_t)v));
+}
+static int l_tile_is_float(tn_lower_t *L, uint32_t node){
+    int dt = L->sema->node_shape[node].dtype;
+    return dt==TN_TLI_FLOAT16 || dt==TN_TLI_FLOAT32 ||
+           dt==TN_TLI_FLOAT64 || dt==TN_TLI_BFLOAT16;
+}
+static int l_tile_elems(const tn_tile_t *t){
+    return (t->rank>=2) ? t->d0*t->d1 : t->d0;
+}
+/* element (r,c) with size-1 axes broadcasting */
+static uint32_t l_tile_get(const tn_tile_t *t, int r, int c){
+    int cols = (t->rank>=2) ? t->d1 : 1;
+    int rr = (t->d0==1) ? 0 : r;
+    int cc = (cols==1)  ? 0 : c;
+    int idx = rr*cols + cc;
+    if (idx<0 || idx>=TN_TILE_MAX) return BIR_VAL_NONE;
+    return t->elem[idx];
+}
+static int l_tile_alloc(tn_lower_t *L){
+    return (L->n_tiles>=TN_TILE_POOL) ? -1 : L->n_tiles++;
+}
+/* rank-0 operand becomes a 1x1 broadcast tile of the scalar value */
+static int l_tile_operand(tn_lower_t *L, uint32_t node, int *out){
+    if (L->sema->node_shape[node].rank == 0){
+        int ti=l_tile_alloc(L); if(ti<0) return -1;
+        tn_tile_t *t=&L->tile_pool[ti]; t->rank=2; t->d0=1; t->d1=1;
+        t->elem[0]=l_expr(L,node);
+        if (t->elem[0]==BIR_VAL_NONE) return -1;
+        *out=ti; return 0;
+    }
+    return l_tile(L, node, out);
+}
+
+static int l_tile(tn_lower_t *L, uint32_t node, int *out){
+    const tn_node_t *n = &L->parser->nodes[node];
+    tn_shape_t sh = L->sema->node_shape[node];
+    int rows = (sh.rank>=1) ? sh.dims[0] : 1;
+    int cols = (sh.rank>=2) ? sh.dims[1] : 1;
+    if (rows<=0 || cols<=0 || rows*cols>TN_TILE_MAX){
+        l_err(L, 99, l_tok(L,node), "tile shape unsupported or too large");
+        return -1;
+    }
+    switch (n->kind){
+    case TN_NK_NAME: {
+        int kind = L->sema->node_sym_kind[node];
+        if (kind==TN_SYM_LOCAL || kind==TN_SYM_LOOPVAR){
+            uint32_t aux = L->sema->node_sym_aux[node];
+            if (aux<TN_MAX_NODES && L->node_tile[aux]>=0){ *out=L->node_tile[aux]; return 0; }
+        }
+        l_err(L, 91, l_tok(L,node), "tile local referenced before defined");
+        return -1;
+    }
+    case TN_NK_SUBSCRIPT: {
+        /* offs[:,None] / offs[None,:]: same elements as the child vec,
+         * reshaped to the column/row shape sema already inferred. */
+        int ci; if (l_tile(L, l_kid(L,node,0), &ci)) return -1;
+        int ne = l_tile_elems(&L->tile_pool[ci]);
+        int ti = l_tile_alloc(L); if (ti<0) return -1;
+        tn_tile_t *t=&L->tile_pool[ti], *child=&L->tile_pool[ci];
+        t->rank=2; t->d0=rows; t->d1=cols;
+        for (int i=0;i<ne && i<TN_TILE_MAX;i++) t->elem[i]=child->elem[i];
+        *out=ti; return 0;
+    }
+    case TN_NK_BINOP: {
+        int la, ra;
+        if (l_tile_operand(L, l_kid(L,node,0), &la)) return -1;
+        if (l_tile_operand(L, l_kid(L,node,1), &ra)) return -1;
+        int ti=l_tile_alloc(L); if(ti<0) return -1;
+        tn_tile_t *t=&L->tile_pool[ti], *A=&L->tile_pool[la], *B=&L->tile_pool[ra];
+        t->rank=2; t->d0=rows; t->d1=cols;
+        int bop=(int)n->flags;
+        for (int r=0;r<rows;r++) for (int c=0;c<cols;c++)
+            t->elem[r*cols+c]=l_emit_binop(L, bop, l_tile_get(A,r,c), l_tile_get(B,r,c));
+        *out=ti; return 0;
+    }
+    case TN_NK_CALL: {
+        uint32_t callee=l_kid(L,node,0);
+        if (L->sema->node_sym_kind[callee]!=TN_SYM_INTRINSIC){
+            l_err(L,96,l_tok(L,node),"non-intrinsic tile call"); return -1; }
+        int id=(int)L->sema->node_sym_aux[callee];
+        uint32_t nk=l_nkids(n);
+        if (id==TN_TLI_ARANGE){
+            int ti=l_tile_alloc(L); if(ti<0)return -1; tn_tile_t*t=&L->tile_pool[ti];
+            t->rank=1; t->d0=rows; t->d1=1;
+            for (int i=0;i<rows;i++) t->elem[i]=l_const_i32(L,i);
+            *out=ti; return 0;
+        }
+        if (id==TN_TLI_ZEROS || id==TN_TLI_ZEROS_LIKE){
+            /* Accumulators are scratch-backed so they survive a K-loop:
+             * alloca the buffer, store the element addresses, init to 0. */
+            int ti=l_tile_alloc(L); if(ti<0)return -1; tn_tile_t*t=&L->tile_pool[ti];
+            t->rank=2; t->d0=rows; t->d1=cols; t->mem=1;
+            int isf=l_tile_is_float(L,node);
+            uint32_t et=isf?L->t_f32:L->t_i32, ept=isf?L->t_ptr_f32:L->t_ptr_i32;
+            uint32_t arr=bir_type_array(L->bir, et, (uint32_t)(rows*cols));
+            uint32_t apt=bir_type_ptr(L->bir, arr, 0);
+            uint32_t base=l_emit(L,BIR_ALLOCA,apt,0);
+            uint32_t z = isf ? BIR_MAKE_CONST(bir_const_float(L->bir,L->t_f32,0.0))
+                             : l_const_i32(L,0);
+            for (int i=0;i<rows*cols;i++){
+                uint32_t gep=l_emit(L,BIR_GEP,ept,0); l_op(L,gep,base); l_op(L,gep,l_const_i32(L,i));
+                uint32_t st=l_emit(L,BIR_STORE,L->t_void,0); l_op(L,st,z); l_op(L,st,gep);
+                t->elem[i]=gep;
+            }
+            *out=ti; return 0;
+        }
+        if (id==TN_TLI_LOAD){
+            uint32_t addr=0;
+            for (uint32_t i=1;i<nk;i++){ uint32_t k=l_kid(L,node,i);
+                if (L->parser->nodes[k].kind!=TN_NK_KEYWORD){ addr=k; break; } }
+            int ai; if(l_tile(L,addr,&ai)) return -1;
+            int ti=l_tile_alloc(L); if(ti<0)return -1;
+            tn_tile_t *t=&L->tile_pool[ti], *A=&L->tile_pool[ai];
+            t->rank=2; t->d0=rows; t->d1=cols;
+            int ne=l_tile_elems(A);
+            for (int i=0;i<rows*cols;i++){
+                uint32_t a=(i<ne)?A->elem[i]:BIR_VAL_NONE;
+                uint32_t pty=l_val_type(L,a);  /* element type from the pointer's pointee */
+                uint32_t dty=(l_type_kind(L,pty)==BIR_TYPE_PTR)? L->bir->types[pty].inner : L->t_i32;
+                uint32_t ld=l_emit(L,BIR_LOAD,dty,0); l_op(L,ld,a);
+                t->elem[i]=ld;
+            }
+            *out=ti; return 0;
+        }
+        if (id==TN_TLI_DOT){
+            int ai,bi;
+            if (l_tile(L,l_kid(L,node,1),&ai)) return -1;
+            if (l_tile(L,l_kid(L,node,2),&bi)) return -1;
+            tn_tile_t *A=&L->tile_pool[ai], *B=&L->tile_pool[bi];
+            int Md=A->d0, Kd=A->d1, Nd=B->d1;
+            int ti=l_tile_alloc(L); if(ti<0)return -1; tn_tile_t*t=&L->tile_pool[ti];
+            t->rank=2; t->d0=Md; t->d1=Nd;
+            /* float vs int dot follows the loaded operand element type */
+            int isf = (l_type_kind(L, l_val_type(L, A->elem[0]))==BIR_TYPE_FLOAT);
+            uint32_t mty=isf?L->t_f32:L->t_i32;
+            for (int m=0;m<Md;m++) for (int nn=0;nn<Nd;nn++){
+                uint32_t acc=BIR_VAL_NONE;
+                for (int k=0;k<Kd;k++){
+                    uint32_t pr=l_emit(L, isf?BIR_FMUL:BIR_MUL, mty, 0);
+                    l_op(L,pr,A->elem[m*Kd+k]); l_op(L,pr,B->elem[k*Nd+nn]);
+                    if (acc==BIR_VAL_NONE) acc=pr;
+                    else { uint32_t s=l_emit(L, isf?BIR_FADD:BIR_ADD, mty, 0);
+                           l_op(L,s,acc); l_op(L,s,pr); acc=s; }
+                }
+                t->elem[m*Nd+nn]=acc;
+            }
+            *out=ti; return 0;
+        }
+        l_err(L,95,l_tok(L,node),"tile intrinsic not yet lowered");
+        return -1;
+    }
+    default:
+        l_err(L,97,l_tok(L,node),"tile expression kind not lowered");
+        return -1;
+    }
+}
+
+/* tl.store(addr_tile, value_tile): one BIR_STORE per element. */
+static void l_store_tile(tn_lower_t *L, uint32_t call_node){
+    uint32_t nk=l_nkids(&L->parser->nodes[call_node]);
+    uint32_t addr=0, val=0; int pos=0;
+    for (uint32_t i=1;i<nk;i++){ uint32_t k=l_kid(L,call_node,i);
+        if (L->parser->nodes[k].kind==TN_NK_KEYWORD) continue;
+        if (pos==0) addr=k; else if (pos==1) val=k; pos++; }
+    int ai,vi; if(l_tile(L,addr,&ai)) return; if(l_tile(L,val,&vi)) return;
+    tn_tile_t *A=&L->tile_pool[ai], *V=&L->tile_pool[vi];
+    int ne=l_tile_elems(A);
+    for (int i=0;i<ne;i++){
+        uint32_t vval=V->elem[i];
+        if (V->mem){ /* scratch accumulator: read the element first */
+            uint32_t pty=l_val_type(L,vval);
+            uint32_t dty=(l_type_kind(L,pty)==BIR_TYPE_PTR)?L->bir->types[pty].inner:L->t_f32;
+            uint32_t ld=l_emit(L,BIR_LOAD,dty,0); l_op(L,ld,vval); vval=ld;
+        }
+        uint32_t st=l_emit(L,BIR_STORE,L->t_void,0);
+        l_op(L,st,vval); l_op(L,st,A->elem[i]);
+    }
+}
+
+/* Does any node in this subtree carry a rank-2 shape? Decides whether
+ * the kernel uses the tile (materialize/unroll) lowering path. */
+static int l_subtree_has_rank2(tn_lower_t *L, uint32_t node){
+    if (node==0 || node>=L->parser->num_nodes) return 0;
+    if (L->sema->node_shape[node].rank >= 2) return 1;
+    uint32_t nk=l_nkids(&L->parser->nodes[node]);
+    for (uint32_t i=0;i<nk;i++)
+        if (l_subtree_has_rank2(L, l_kid(L,node,i))) return 1;
+    return 0;
+}
+
 static uint32_t l_call(tn_lower_t *L, uint32_t node_idx)
 {
     const tn_node_t *n = &L->parser->nodes[node_idx];
@@ -711,6 +903,13 @@ static void l_stmt(tn_lower_t *L, uint32_t node_idx);
 static void l_assign(tn_lower_t *L, uint32_t node_idx)
 {
     uint32_t value_node = l_kid(L, node_idx, 1);
+    /* In a tile kernel, a rank>=1 RHS materializes into a tile bound to
+     * this Assign node; Name references resolve through node_tile. */
+    if (L->tile_mode && L->sema->node_shape[value_node].rank >= 1){
+        int ti;
+        if (l_tile(L, value_node, &ti)==0) L->node_tile[node_idx]=ti;
+        return;
+    }
     uint32_t v = l_expr(L, value_node);
     L->node_val[node_idx] = v;
 }
@@ -733,6 +932,56 @@ static void l_block(tn_lower_t *L, uint32_t node_idx)
     }
 }
 
+/* Lower `for k in range(start, stop, step)` as a counted loop.
+ *
+ * The counter is a phi, built by hand, not an alloca. The tidy move
+ * would be to stash k in an alloca and let mem2reg lift it to a phi,
+ * the way the CUDA loops do it. But mem2reg takes one look at this loop,
+ * decides the counter never changes, folds it to its start value, and
+ * the loop runs forever. Emitting the phi ourselves dodges that, and the
+ * backends already know how to copy a phi's value in along each edge.
+ * Bodies are straight-line only for now, which is all the matmul K-loop
+ * asks for. */
+static void l_for(tn_lower_t *L, uint32_t node_idx)
+{
+    uint32_t nk = l_nkids(&L->parser->nodes[node_idx]);
+    if (nk < 3) { l_err(L,99,l_tok(L,node_idx),"malformed for"); return; }
+    uint32_t iter = l_kid(L, node_idx, 1);
+    uint32_t body = l_kid(L, node_idx, 2);
+    const tn_node_t *it = &L->parser->nodes[iter];
+    if (it->kind != TN_NK_CALL){ l_err(L,99,l_tok(L,iter),"for iterable must be range()"); return; }
+    int nargs = (int)l_nkids(it) - 1;   /* kid 0 is the 'range' callee */
+    uint32_t start, stop, step;
+    if (nargs <= 1){ start=l_const_i32(L,0); stop=(nargs==1)?l_expr(L,l_kid(L,iter,1)):l_const_i32(L,0); step=l_const_i32(L,1); }
+    else if (nargs == 2){ start=l_expr(L,l_kid(L,iter,1)); stop=l_expr(L,l_kid(L,iter,2)); step=l_const_i32(L,1); }
+    else { start=l_expr(L,l_kid(L,iter,1)); stop=l_expr(L,l_kid(L,iter,2)); step=l_expr(L,l_kid(L,iter,3)); }
+    if (start==BIR_VAL_NONE||stop==BIR_VAL_NONE||step==BIR_VAL_NONE) return;
+
+    /* Counter is a real phi (no alloca), so mem2reg can't fold it; the
+     * backend's phi edge-copies carry start in on the preheader edge and
+     * the increment in on the back-edge. */
+    uint32_t pre = L->cur_block;
+    uint32_t br0 = l_emit(L, BIR_BR, L->t_void, 0);                 /* preheader -> head */
+
+    uint32_t head = l_new_block(L); l_op(L, br0, head);
+    L->cur_block = head;
+    uint32_t kphi = l_emit(L, BIR_PHI, L->t_i32, 0);
+    l_op(L, kphi, pre); l_op(L, kphi, start);                       /* [preheader: start] */
+    uint32_t cond = l_emit(L, BIR_ICMP, L->t_i32, BIR_ICMP_SLT); l_op(L,cond,kphi); l_op(L,cond,stop);
+    uint32_t brc = l_emit(L, BIR_BR_COND, L->t_void, 0); l_op(L,brc,cond);  /* [0]=cond */
+
+    uint32_t bodyb = l_new_block(L); l_op(L, brc, bodyb);                   /* [1]=true */
+    L->cur_block = bodyb;
+    L->node_val[node_idx] = kphi;          /* bind the loop variable k */
+    l_block(L, body);
+    uint32_t kn = l_emit(L, BIR_ADD, L->t_i32, 0); l_op(L,kn,kphi); l_op(L,kn,step);
+    l_op(L, kphi, bodyb); l_op(L, kphi, kn);   /* phi back-edge pair [body: k+step] */
+    uint32_t brh = l_emit(L, BIR_BR, L->t_void, 0); l_op(L,brh,head);       /* back-edge */
+
+    uint32_t exitb = l_new_block(L); l_op(L, brc, exitb);                   /* [2]=false */
+    L->cur_block = exitb;
+}
+
 static void l_stmt(tn_lower_t *L, uint32_t node_idx)
 {
     if (node_idx == 0 || node_idx >= L->parser->num_nodes) return;
@@ -752,6 +1001,16 @@ static void l_stmt(tn_lower_t *L, uint32_t node_idx)
              * unlowerable. */
             if (en->kind == TN_NK_LITERAL && en->flags == TN_LIT_STRING) {
                 break;
+            }
+            /* In a tile kernel, tl.store(addr_tile, value_tile) fans out
+             * to one BIR_STORE per element. */
+            if (L->tile_mode && en->kind == TN_NK_CALL && l_nkids(en) > 0){
+                uint32_t callee = l_kid(L, expr, 0);
+                if (L->sema->node_sym_kind[callee]==TN_SYM_INTRINSIC &&
+                    (int)L->sema->node_sym_aux[callee]==TN_TLI_STORE){
+                    l_store_tile(L, expr);
+                    break;
+                }
             }
             (void)l_expr(L, expr);
         }
@@ -779,6 +1038,29 @@ static void l_stmt(tn_lower_t *L, uint32_t node_idx)
             l_err(L, 102, l_tok(L, target_idx),
                   "AugAssign target kind not yet lowered");
             break;
+        }
+
+        /* Tile accumulator: acc += <tile>. acc is scratch-backed, so this
+         * is a read-add-write per element and persists across the loop. */
+        if (L->tile_mode && n->flags == TN_AUG_ADD){
+            int tk=L->sema->node_sym_kind[target_idx];
+            uint32_t aux=L->sema->node_sym_aux[target_idx];
+            if ((tk==TN_SYM_LOCAL||tk==TN_SYM_LOOPVAR) && aux<TN_MAX_NODES &&
+                L->node_tile[aux]>=0 && L->tile_pool[L->node_tile[aux]].mem){
+                int ri; if (l_tile(L, rhs_idx, &ri)==0){
+                    tn_tile_t *ACC=&L->tile_pool[L->node_tile[aux]], *R=&L->tile_pool[ri];
+                    int ne=l_tile_elems(ACC);
+                    for (int i=0;i<ne;i++){
+                        uint32_t pty=l_val_type(L,ACC->elem[i]);
+                        uint32_t dty=(l_type_kind(L,pty)==BIR_TYPE_PTR)?L->bir->types[pty].inner:L->t_f32;
+                        int isf=(l_type_kind(L,dty)==BIR_TYPE_FLOAT);
+                        uint32_t cur=l_emit(L,BIR_LOAD,dty,0); l_op(L,cur,ACC->elem[i]);
+                        uint32_t add=l_emit(L, isf?BIR_FADD:BIR_ADD, dty,0); l_op(L,add,cur); l_op(L,add,R->elem[i]);
+                        uint32_t st=l_emit(L,BIR_STORE,L->t_void,0); l_op(L,st,add); l_op(L,st,ACC->elem[i]);
+                    }
+                }
+                break;
+            }
         }
 
         uint32_t old_val = l_expr(L, target_idx);
@@ -837,9 +1119,11 @@ static void l_stmt(tn_lower_t *L, uint32_t node_idx)
     }
     case TN_NK_IF:
     case TN_NK_FOR:
+        l_for(L, node_idx);
+        break;
     case TN_NK_WHILE:
         l_err(L, 99, l_tok(L, node_idx),
-              "control-flow statement waits for sitting three");
+              "while loops not yet lowered");
         break;
     default:
         break;
@@ -943,6 +1227,10 @@ static void l_funcdef(tn_lower_t *L, uint32_t node_idx, int is_kernel)
     for (uint32_t i = 0; i < nk; i++) {
         uint32_t kid = l_kid(L, node_idx, i);
         if (P->nodes[kid].kind == TN_NK_BLOCK) {
+            /* A kernel with any rank-2 tile uses the materialize/unroll
+             * path for its whole body; otherwise the scalar lane path. */
+            L->tile_mode = l_subtree_has_rank2(L, kid);
+            L->n_tiles = 0;
             l_block(L, kid);
             break;
         }
@@ -956,7 +1244,13 @@ static void l_funcdef(tn_lower_t *L, uint32_t node_idx, int is_kernel)
         (void)l_emit(L, BIR_RET, L->t_void, 0);
     }
 
-    F->total_insts = B->num_insts;
+    /* Sum every block, not just the last one: a kernel with control flow
+     * (e.g. a matmul K-loop) spans several blocks, and cfold/dce walk
+     * [first_inst, first_inst + total_insts), so an undercount truncates
+     * the range and corrupts the loop. */
+    F->total_insts = 0;
+    for (uint16_t bi = 0; bi < F->num_blocks; bi++)
+        F->total_insts += M->blocks[F->first_block + bi].num_insts;
 }
 
 /* Look at the decorators that precede a FuncDef in the AST and
@@ -1005,6 +1299,7 @@ void tn_lower_init(tn_lower_t *L, const tn_parse_t *P,
     L->sema   = S;
     L->bir    = M;
     for (uint32_t i = 0; i < TN_MAX_NODES; i++) L->node_val[i] = BIR_VAL_NONE;
+    for (uint32_t i = 0; i < TN_MAX_NODES; i++) L->node_tile[i] = -1;
 }
 
 int tn_lower(tn_lower_t *L)
