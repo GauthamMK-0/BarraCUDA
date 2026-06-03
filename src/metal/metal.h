@@ -2,6 +2,7 @@
 #define BARRACUDA_METAL_H
 
 #include "bir.h"
+#include "bir_struct.h"
 
 /* Apple Metal backend, which is to say the part of BarraCUDA that lowers
  * your perfectly serviceable CUDA source into the Metal Shading Language
@@ -85,6 +86,13 @@ typedef struct metal_module_t {
 
     char        out_buf[MTL_MAX_OUT];
     uint32_t    out_len;
+
+    /* Transient emit state. The structure tree is rebuilt fresh for each
+     * kernel as it is written out, and indent is the current nesting so the
+     * MSL comes out looking like a person laid it down rather than a printer
+     * that had given up. Both are scratch, meaningful only mid-emit. */
+    bst_tree_t  tree;
+    uint32_t    indent;
 } metal_module_t;
 
 /* ---- Public API ---- */

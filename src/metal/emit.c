@@ -338,6 +338,17 @@ static int mt_val(metal_module_t *mm, uint32_t v)
     return mt_wfmt(mm, "v%u", (unsigned)idx);
 }
 
+/* Lay down the current indent, four spaces a rung. Structured output earns
+ * its keep by looking structured, and nothing says "a machine gave up here"
+ * quite like a wall of statements all jammed against the left margin. */
+
+static int mt_ind(metal_module_t *mm)
+{
+    for (uint32_t i = 0; i < mm->indent; i++)
+        if (!mt_wstr(mm, "    ")) return 0;
+    return 1;
+}
+
 /* The left-hand side of an assignment to a result variable. The variable
  * was already declared, sans initialiser, up at the top of the function
  * body in the first pass, so down here it is strictly assignment and
@@ -345,23 +356,297 @@ static int mt_val(metal_module_t *mm, uint32_t v)
 
 static int mt_lhs(metal_module_t *mm, uint32_t gi)
 {
-    if (!mt_wstr(mm, "    ")) return 0;
+    if (!mt_ind(mm)) return 0;
     return mt_wfmt(mm, "v%u = ", (unsigned)gi);
 }
 
+/* ---- One Statement ----
+ * Lower a single straight-line BIR instruction into one line of Metal C++,
+ * already wearing the right indent. Anything that is really a control
+ * decision (the branches, the return, the unreachable) is not a statement
+ * the structure walk wants from here, it is a shape the walk draws itself,
+ * so those are waved through with nothing emitted. Params and phis emit
+ * nothing either: a param is just a name a use will reach for, and a phi
+ * has been paid off in copies on the edges that feed it. */
+
+static int mt_stmt(metal_module_t *mm, uint32_t gi)
+{
+    const bir_module_t *M = mm->bir;
+    const bir_inst_t *I = &M->insts[gi];
+    const char *bop = 0, *mfn = 0, *m2fn = 0;
+
+    switch (I->op) {
+    /* drawn by the structure walk, not emitted as a statement here */
+    case BIR_BR: case BIR_BR_COND: case BIR_RET: case BIR_UNREACHABLE:
+    /* nothing to say: a name to be used, or a phi already settled */
+    case BIR_PARAM: case BIR_PHI:
+        return 1;
+
+    /* integer and floating-point binary operators */
+    case BIR_ADD: case BIR_FADD: bop = "+";  goto bin;
+    case BIR_SUB: case BIR_FSUB: bop = "-";  goto bin;
+    case BIR_MUL: case BIR_FMUL: bop = "*";  goto bin;
+    case BIR_SDIV: case BIR_UDIV: case BIR_FDIV: bop = "/"; goto bin;
+    case BIR_SREM: case BIR_UREM: bop = "%";  goto bin;
+    case BIR_AND: bop = "&";  goto bin;
+    case BIR_OR:  bop = "|";  goto bin;
+    case BIR_XOR: bop = "^";  goto bin;
+    case BIR_SHL: bop = "<<"; goto bin;
+    case BIR_LSHR: case BIR_ASHR: bop = ">>"; goto bin;
+    bin:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        if (!mt_wfmt(mm, " %s ", bop)) return 0;
+        if (!mt_val(mm, I->operands[1])) return 0;
+        return mt_wstr(mm, ";\n");
+
+    case BIR_ICMP: case BIR_FCMP:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        if (!mt_wfmt(mm, " %s ", mt_cmpop(I->subop))) return 0;
+        if (!mt_val(mm, I->operands[1])) return 0;
+        return mt_wstr(mm, ";\n");
+
+    /* unary math intrinsics */
+    case BIR_SQRT:   mfn = "sqrt";  goto unfn;
+    case BIR_RSQ:    mfn = "rsqrt"; goto unfn;
+    case BIR_EXP2:   mfn = "exp2";  goto unfn;
+    case BIR_LOG2:   mfn = "log2";  goto unfn;
+    case BIR_SIN:    mfn = "sin";   goto unfn;
+    case BIR_COS:    mfn = "cos";   goto unfn;
+    case BIR_FABS:   mfn = "fabs";  goto unfn;
+    case BIR_FLOOR:  mfn = "floor"; goto unfn;
+    case BIR_CEIL:   mfn = "ceil";  goto unfn;
+    case BIR_FTRUNC: mfn = "trunc"; goto unfn;
+    case BIR_RNDNE:  mfn = "rint";  goto unfn;
+    unfn:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_wfmt(mm, "%s(", mfn)) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        return mt_wstr(mm, ");\n");
+
+    case BIR_RCP:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_wstr(mm, "1.0f / ")) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        return mt_wstr(mm, ";\n");
+
+    /* binary math intrinsics */
+    case BIR_FMAX: m2fn = "fmax"; goto binfn;
+    case BIR_FMIN: m2fn = "fmin"; goto binfn;
+    case BIR_FREM: m2fn = "fmod"; goto binfn;
+    binfn:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_wfmt(mm, "%s(", m2fn)) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        if (!mt_wstr(mm, ", ")) return 0;
+        if (!mt_val(mm, I->operands[1])) return 0;
+        return mt_wstr(mm, ");\n");
+
+    /* numeric conversions */
+    case BIR_TRUNC: case BIR_ZEXT: case BIR_SEXT:
+    case BIR_FPTRUNC: case BIR_FPEXT:
+    case BIR_FPTOSI: case BIR_FPTOUI:
+    case BIR_SITOFP: case BIR_UITOFP:
+    case BIR_PTRTOINT: case BIR_INTTOPTR:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_wstr(mm, "(")) return 0;
+        if (!mt_etype(mm, I->type)) return 0;
+        if (!mt_wstr(mm, ")(")) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        return mt_wstr(mm, ");\n");
+    case BIR_BITCAST:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_wstr(mm, "as_type<")) return 0;
+        if (!mt_etype(mm, I->type)) return 0;
+        if (!mt_wstr(mm, ">(")) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        return mt_wstr(mm, ");\n");
+
+    /* memory */
+    case BIR_GEP:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        if (I->num_operands >= 2) {
+            if (!mt_wstr(mm, " + (")) return 0;
+            if (!mt_val(mm, I->operands[1])) return 0;
+            if (!mt_wstr(mm, ")")) return 0;
+        }
+        return mt_wstr(mm, ";\n");
+    case BIR_LOAD:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_wstr(mm, "*(")) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        return mt_wstr(mm, ");\n");
+    case BIR_STORE:
+        /* ops[0] = value, ops[1] = address */
+        if (!mt_ind(mm)) return 0;
+        if (!mt_wstr(mm, "*(")) return 0;
+        if (!mt_val(mm, I->operands[1])) return 0;
+        if (!mt_wstr(mm, ") = ")) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        return mt_wstr(mm, ";\n");
+
+    /* thread model */
+    case BIR_THREAD_ID:
+        if (!mt_lhs(mm, gi)) return 0;
+        return mt_wfmt(mm, "tid.%c;\n", mt_dim(I->subop));
+    case BIR_BLOCK_ID:
+        if (!mt_lhs(mm, gi)) return 0;
+        return mt_wfmt(mm, "bid.%c;\n", mt_dim(I->subop));
+    case BIR_BLOCK_DIM:
+        if (!mt_lhs(mm, gi)) return 0;
+        return mt_wfmt(mm, "bdim.%c;\n", mt_dim(I->subop));
+    case BIR_GRID_DIM:
+        if (!mt_lhs(mm, gi)) return 0;
+        return mt_wfmt(mm, "gdim.%c;\n", mt_dim(I->subop));
+
+    case BIR_SELECT:
+        if (!mt_lhs(mm, gi)) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        if (!mt_wstr(mm, " ? ")) return 0;
+        if (!mt_val(mm, I->operands[1])) return 0;
+        if (!mt_wstr(mm, " : ")) return 0;
+        if (!mt_val(mm, I->operands[2])) return 0;
+        return mt_wstr(mm, ";\n");
+
+    case BIR_BARRIER:
+    case BIR_BARRIER_GROUP:
+        if (!mt_ind(mm)) return 0;
+        return mt_wstr(mm,
+            "threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+
+    /* not yet lowered: keep the output compilable by zero-init'ing any
+     * result and leaving a marker for the next sitting. */
+    default:
+        if (M->types[I->type].kind != BIR_TYPE_VOID) {
+            if (!mt_lhs(mm, gi)) return 0;
+            return mt_wfmt(mm, "{}; /* TODO: %s */\n", bir_op_name(I->op));
+        }
+        if (!mt_ind(mm)) return 0;
+        return mt_wfmt(mm, "/* TODO: %s */\n", bir_op_name(I->op));
+    }
+}
+
+/* ---- The Structure Walk ----
+ * Walk the tree bir_structurize handed over and turn its shape into nested
+ * Metal C++. This is the half of the job that is unashamedly Apple's
+ * problem made readable: ifs become ifs, loops become while(true) with the
+ * exits drawn as break and the laps as continue, and the phi copies fall
+ * where the structuriser pinned them. Not a single goto in sight, which was
+ * the entire point of the exercise. */
+
+static int mt_node_empty(const bst_tree_t *T, uint32_t id)
+{
+    if (id == BST_NONE) return 1;
+    const bst_node_t *n = &T->nodes[id];
+    return n->kind == BST_SEQ && n->nkids == 0;
+}
+
+static int mt_walk(metal_module_t *mm, uint32_t node_id)
+{
+    if (node_id == BST_NONE) return 1;
+    const bst_tree_t   *T = &mm->tree;
+    const bir_module_t *M = mm->bir;
+    const bst_node_t   *n = &T->nodes[node_id];
+
+    switch (n->kind) {
+    case BST_SEQ:
+        for (uint16_t i = 0; i < n->nkids; i++)
+            if (!mt_walk(mm, T->kids[n->kid_start + i])) return 0;
+        return 1;
+
+    case BST_BLOCK: {
+        const bir_block_t *B = &M->blocks[n->block];
+        for (uint32_t ii = 0; ii < B->num_insts; ii++) {
+            uint32_t gi = B->first_inst + ii;
+            if (gi >= M->num_insts) break;
+            if (!mt_stmt(mm, gi)) return 0;
+        }
+        return 1;
+    }
+
+    case BST_COPY:
+        for (uint32_t i = 0; i < n->copy_count; i++) {
+            const bst_copy_t *c = &T->copies[n->copy_start + i];
+            if (!mt_ind(mm)) return 0;
+            if (!mt_wfmt(mm, "v%u = ", (unsigned)c->dest)) return 0;
+            if (!mt_val(mm, c->src)) return 0;
+            if (!mt_wstr(mm, ";\n")) return 0;
+        }
+        return 1;
+
+    case BST_IF:
+        if (!mt_ind(mm)) return 0;
+        if (!mt_wstr(mm, "if (")) return 0;
+        if (!mt_val(mm, n->cond)) return 0;
+        if (!mt_wstr(mm, ") {\n")) return 0;
+        mm->indent++;
+        if (!mt_walk(mm, n->then_kid)) return 0;
+        mm->indent--;
+        if (!mt_ind(mm)) return 0;
+        if (!mt_wstr(mm, "}")) return 0;
+        if (!mt_node_empty(T, n->else_kid)) {
+            if (!mt_wstr(mm, " else {\n")) return 0;
+            mm->indent++;
+            if (!mt_walk(mm, n->else_kid)) return 0;
+            mm->indent--;
+            if (!mt_ind(mm)) return 0;
+            if (!mt_wstr(mm, "}")) return 0;
+        }
+        return mt_wstr(mm, "\n");
+
+    case BST_LOOP:
+        if (!mt_ind(mm)) return 0;
+        if (!mt_wstr(mm, "while (true) {\n")) return 0;
+        mm->indent++;
+        if (!mt_walk(mm, n->then_kid)) return 0;
+        mm->indent--;
+        if (!mt_ind(mm)) return 0;
+        return mt_wstr(mm, "}\n");
+
+    case BST_BREAK:
+        if (!mt_ind(mm)) return 0;
+        return mt_wstr(mm, "break;\n");
+
+    case BST_CONTINUE:
+        if (!mt_ind(mm)) return 0;
+        return mt_wstr(mm, "continue;\n");
+
+    case BST_RET: {
+        const bir_block_t *B = &M->blocks[n->block];
+        const bir_inst_t  *I = &M->insts[B->first_inst + B->num_insts - 1];
+        if (!mt_ind(mm)) return 0;
+        if (I->num_operands == 0) return mt_wstr(mm, "return;\n");
+        if (!mt_wstr(mm, "return ")) return 0;
+        if (!mt_val(mm, I->operands[0])) return 0;
+        return mt_wstr(mm, ";\n");
+    }
+
+    case BST_UNREACHABLE:
+        if (!mt_ind(mm)) return 0;
+        return mt_wstr(mm, "/* unreachable */\n");
+
+    default:
+        return 1;
+    }
+}
+
 /* ---- Function Body ----
- * Walk the blocks and lower each BIR instruction into Metal-flavoured
- * C++. Two passes cover the same ground, which looks wasteful until the
- * reason surfaces. The first pass declares every result variable at
- * function scope with no initialiser, because C++ takes a famously dim
- * view of a goto that vaults over an initialisation, and the control flow
- * here is nothing but gotos all the way down. The second pass writes the
- * statements as plain assignments, the declarations having already been
- * seen to. Every block earns a label so that branches become honest
- * gotos, and where the PTX backend leans on the NVIDIA driver to forgive
- * its unstructured ways, the Metal backend leans on Apple's compiler for
- * precisely the same courtesy, standing a respectful distance away and
- * looking as though it meant all of it. */
+ * First declare every result variable up at function scope with no
+ * initialiser. This survived the switch from gotos to structure for a
+ * reason that merely changed clothes: a value can be born in one block and
+ * read in another, and a declaration trapped inside an if or a loop would
+ * not live to see the use. Hoisting the lot, phi results and all, dodges
+ * every last C scoping technicality in one move.
+ *
+ * Then work out the shape of the function with the structuriser and walk
+ * it. Where this backend once leaned on Apple's compiler to forgive a pile
+ * of gotos, it now hands over honest structured C++ and has nothing left to
+ * apologise for. If the CFG will not structure (an irreducible tangle, or a
+ * switch the recovery does not yet handle) the kernel is refused out loud
+ * rather than smuggled out wrong: the roadmap's switch dispatcher is the
+ * answer, the day a real one turns up to demand it. */
 
 static int mt_kbody(metal_module_t *mm, const mtl_kern_t *K)
 {
@@ -370,7 +655,7 @@ static int mt_kbody(metal_module_t *mm, const mtl_kern_t *K)
 
     if (!mt_wstr(mm, "\n{\n")) return 0;
 
-    /* Pass 1: predeclare result variables. */
+    /* Pass 1: predeclare result variables at function scope. */
     for (uint16_t bi = 0; bi < F->num_blocks; bi++) {
         uint32_t bidx = (uint32_t)F->first_block + bi;
         if (bidx >= M->num_blocks) break;
@@ -387,213 +672,23 @@ static int mt_kbody(metal_module_t *mm, const mtl_kern_t *K)
         }
     }
 
-    /* Pass 2: lower statements. */
-    for (uint16_t bi = 0; bi < F->num_blocks; bi++) {
-        uint32_t bidx = (uint32_t)F->first_block + bi;
-        if (bidx >= M->num_blocks) break;
-        const bir_block_t *B = &M->blocks[bidx];
-
-        if (!mt_wfmt(mm, "L%u: ;\n", (unsigned)bidx)) return 0;
-
-        for (uint32_t ii = 0; ii < B->num_insts; ii++) {
-            uint32_t gi = B->first_inst + ii;
-            if (gi >= M->num_insts) break;
-            const bir_inst_t *I = &M->insts[gi];
-            const char *bop = 0, *mfn = 0, *m2fn = 0;
-
-            switch (I->op) {
-            case BIR_PARAM:
-                break;  /* uses resolve to the MSL parameter name */
-
-            /* integer and floating-point binary operators */
-            case BIR_ADD: case BIR_FADD: bop = "+";  goto bin;
-            case BIR_SUB: case BIR_FSUB: bop = "-";  goto bin;
-            case BIR_MUL: case BIR_FMUL: bop = "*";  goto bin;
-            case BIR_SDIV: case BIR_UDIV: case BIR_FDIV: bop = "/"; goto bin;
-            case BIR_SREM: case BIR_UREM: bop = "%";  goto bin;
-            case BIR_AND: bop = "&";  goto bin;
-            case BIR_OR:  bop = "|";  goto bin;
-            case BIR_XOR: bop = "^";  goto bin;
-            case BIR_SHL: bop = "<<"; goto bin;
-            case BIR_LSHR: case BIR_ASHR: bop = ">>"; goto bin;
-            bin:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wfmt(mm, " %s ", bop)) return 0;
-                if (!mt_val(mm, I->operands[1])) return 0;
-                if (!mt_wstr(mm, ";\n")) return 0;
-                break;
-
-            case BIR_ICMP: case BIR_FCMP:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wfmt(mm, " %s ", mt_cmpop(I->subop))) return 0;
-                if (!mt_val(mm, I->operands[1])) return 0;
-                if (!mt_wstr(mm, ";\n")) return 0;
-                break;
-
-            /* unary math intrinsics */
-            case BIR_SQRT:   mfn = "sqrt";  goto unfn;
-            case BIR_RSQ:    mfn = "rsqrt"; goto unfn;
-            case BIR_EXP2:   mfn = "exp2";  goto unfn;
-            case BIR_LOG2:   mfn = "log2";  goto unfn;
-            case BIR_SIN:    mfn = "sin";   goto unfn;
-            case BIR_COS:    mfn = "cos";   goto unfn;
-            case BIR_FABS:   mfn = "fabs";  goto unfn;
-            case BIR_FLOOR:  mfn = "floor"; goto unfn;
-            case BIR_CEIL:   mfn = "ceil";  goto unfn;
-            case BIR_FTRUNC: mfn = "trunc"; goto unfn;
-            case BIR_RNDNE:  mfn = "rint";  goto unfn;
-            unfn:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wfmt(mm, "%s(", mfn)) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wstr(mm, ");\n")) return 0;
-                break;
-
-            case BIR_RCP:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wstr(mm, "1.0f / ")) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wstr(mm, ";\n")) return 0;
-                break;
-
-            /* binary math intrinsics */
-            case BIR_FMAX: m2fn = "fmax"; goto binfn;
-            case BIR_FMIN: m2fn = "fmin"; goto binfn;
-            case BIR_FREM: m2fn = "fmod"; goto binfn;
-            binfn:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wfmt(mm, "%s(", m2fn)) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wstr(mm, ", ")) return 0;
-                if (!mt_val(mm, I->operands[1])) return 0;
-                if (!mt_wstr(mm, ");\n")) return 0;
-                break;
-
-            /* numeric conversions */
-            case BIR_TRUNC: case BIR_ZEXT: case BIR_SEXT:
-            case BIR_FPTRUNC: case BIR_FPEXT:
-            case BIR_FPTOSI: case BIR_FPTOUI:
-            case BIR_SITOFP: case BIR_UITOFP:
-            case BIR_PTRTOINT: case BIR_INTTOPTR:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wstr(mm, "(")) return 0;
-                if (!mt_etype(mm, I->type)) return 0;
-                if (!mt_wstr(mm, ")(")) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wstr(mm, ");\n")) return 0;
-                break;
-            case BIR_BITCAST:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wstr(mm, "as_type<")) return 0;
-                if (!mt_etype(mm, I->type)) return 0;
-                if (!mt_wstr(mm, ">(")) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wstr(mm, ");\n")) return 0;
-                break;
-
-            /* memory */
-            case BIR_GEP:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (I->num_operands >= 2) {
-                    if (!mt_wstr(mm, " + (")) return 0;
-                    if (!mt_val(mm, I->operands[1])) return 0;
-                    if (!mt_wstr(mm, ")")) return 0;
-                }
-                if (!mt_wstr(mm, ";\n")) return 0;
-                break;
-            case BIR_LOAD:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wstr(mm, "*(")) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wstr(mm, ");\n")) return 0;
-                break;
-            case BIR_STORE:
-                /* ops[0] = value, ops[1] = address */
-                if (!mt_wstr(mm, "    *(")) return 0;
-                if (!mt_val(mm, I->operands[1])) return 0;
-                if (!mt_wstr(mm, ") = ")) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wstr(mm, ";\n")) return 0;
-                break;
-
-            /* thread model */
-            case BIR_THREAD_ID:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wfmt(mm, "tid.%c;\n", mt_dim(I->subop))) return 0;
-                break;
-            case BIR_BLOCK_ID:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wfmt(mm, "bid.%c;\n", mt_dim(I->subop))) return 0;
-                break;
-            case BIR_BLOCK_DIM:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wfmt(mm, "bdim.%c;\n", mt_dim(I->subop))) return 0;
-                break;
-            case BIR_GRID_DIM:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_wfmt(mm, "gdim.%c;\n", mt_dim(I->subop))) return 0;
-                break;
-
-            case BIR_SELECT:
-                if (!mt_lhs(mm, gi)) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wstr(mm, " ? ")) return 0;
-                if (!mt_val(mm, I->operands[1])) return 0;
-                if (!mt_wstr(mm, " : ")) return 0;
-                if (!mt_val(mm, I->operands[2])) return 0;
-                if (!mt_wstr(mm, ";\n")) return 0;
-                break;
-
-            case BIR_BARRIER:
-            case BIR_BARRIER_GROUP:
-                if (!mt_wstr(mm,
-                    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"))
-                    return 0;
-                break;
-
-            /* control flow */
-            case BIR_BR:
-                if (!mt_wfmt(mm, "    goto L%u;\n",
-                             (unsigned)I->operands[0])) return 0;
-                break;
-            case BIR_BR_COND:
-                if (!mt_wstr(mm, "    if (")) return 0;
-                if (!mt_val(mm, I->operands[0])) return 0;
-                if (!mt_wfmt(mm, ") goto L%u; else goto L%u;\n",
-                             (unsigned)I->operands[1],
-                             (unsigned)I->operands[2])) return 0;
-                break;
-            case BIR_RET:
-                if (I->num_operands == 0) {
-                    if (!mt_wstr(mm, "    return;\n")) return 0;
-                } else {
-                    if (!mt_wstr(mm, "    return ")) return 0;
-                    if (!mt_val(mm, I->operands[0])) return 0;
-                    if (!mt_wstr(mm, ";\n")) return 0;
-                }
-                break;
-            case BIR_UNREACHABLE:
-                if (!mt_wstr(mm, "    /* unreachable */\n")) return 0;
-                break;
-
-            /* not yet lowered: keep the output compilable by zero-init'ing
-             * any result and leaving a marker for the next sitting. */
-            default:
-                if (M->types[I->type].kind != BIR_TYPE_VOID) {
-                    if (!mt_lhs(mm, gi)) return 0;
-                    if (!mt_wfmt(mm, "{}; /* TODO: %s */\n",
-                                 bir_op_name(I->op))) return 0;
-                } else {
-                    if (!mt_wfmt(mm, "    /* TODO: %s */\n",
-                                 bir_op_name(I->op))) return 0;
-                }
-                break;
-            }
-        }
+    /* Pass 2: recover the structure, then write it down. */
+    int src = bir_structurize(M, K->bir_func, &mm->tree);
+    if (src != BC_OK) {
+        fprintf(stderr, "metal: structuriser fault on kernel '%s'\n",
+                mt_name(M, K->name, "unnamed"));
+        return 0;
     }
+    if (!mm->tree.ok) {
+        fprintf(stderr,
+                "metal: cannot structure kernel '%s': %s\n",
+                mt_name(M, K->name, "unnamed"),
+                mm->tree.bail_reason ? mm->tree.bail_reason : "unknown");
+        return 0;
+    }
+
+    mm->indent = 1;
+    if (!mt_walk(mm, mm->tree.root)) return 0;
 
     return mt_wstr(mm, "}\n\n");
 }
