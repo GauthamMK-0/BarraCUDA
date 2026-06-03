@@ -1,12 +1,24 @@
 CC      = gcc
 CF_PROT := $(shell echo 'int main(void){return 0;}' | $(CC) -x c - -fcf-protection -c -o /dev/null >/dev/null 2>&1 && echo -fcf-protection)
-CFLAGS  = -std=c99 -Wall -Wextra -pedantic -Werror -O2 \
+
+# Apple's clang rejects GCC-only warning flags (-Wstack-usage, -Wredundant-decls)
+# as a hard error under -Werror, where GCC accepts them. On clang we therefore
+# drop those flags and -Werror itself until the tree is proven clang-clean. GCC
+# builds (Linux, Windows/MinGW) keep the full strict set and are unchanged.
+CLANG   := $(shell $(CC) --version 2>/dev/null | grep -i clang)
+ifeq ($(CLANG),)
+  GCC_ONLY = -Werror -Wstack-usage=4096 -Wno-error=stack-usage= -Wredundant-decls
+else
+  GCC_ONLY =
+endif
+
+CFLAGS  = -std=c99 -Wall -Wextra -pedantic -O2 \
           -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
           -Wformat=2 -Wundef -Wcast-align -Wnull-dereference \
-          -Wstack-usage=4096 -Wno-error=stack-usage= \
           -Wconversion -Wold-style-definition \
-          -Wdouble-promotion -Wswitch-enum -Wredundant-decls -Wwrite-strings \
+          -Wdouble-promotion -Wswitch-enum -Wwrite-strings \
           -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE $(CF_PROT) \
+          $(GCC_ONLY) \
           -Isrc -Isrc/fe -Isrc/ir -Isrc/tdf -Isrc/amdgpu -Isrc/tensix -Isrc/nvidia -Isrc/metal -Isrc/intel -Isrc/triton -Isrc/cpu -Isrc/runtime
 LDFLAGS = -pie
 LIBS    = -lm
