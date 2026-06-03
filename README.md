@@ -23,7 +23,6 @@ That last one still surprises me a bit. You can write a Triton kernel, matmul an
 ## Building
 
 ```bash
-# It's C99. It builds with gcc. There are no dependencies.
 make
 
 ```
