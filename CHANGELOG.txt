@@ -1,6 +1,35 @@
 BarraCUDA — Changelog
 =====================
 
+2026-06-04 — Apple Silicon, by way of Metal. A CUDA, HIP or
+Triton kernel now lowers to Metal Shading Language and compiles
+under Apple's own toolchain. The Metal emitter (`--metal`) walks
+BIR and writes MSL that `xcrun metal` accepts; the kernel
+signatures were already there, this fills in the body, every BIR
+instruction to its MSL form, with the thread-model builtins mapped
+to `thread_position_in_threadgroup` and friends and pointers
+tagged device, threadgroup or constant. The piece that made it
+real is a control-flow structuriser, because Metal flatly refuses
+a goto and the first cut emitted labels and jumps that Apple's
+compiler threw straight back. `src/ir/bir_struct.{c,h}` is a
+backend-agnostic analysis: dominators and reverse postorder
+recover the loop headers and merge points, a recursive descent
+rebuilds the nested if/loop/break/continue shape, and phi nodes
+get paid off as copies on the edges that feed them. It describes
+the structure and never touches the BIR, so the AMD, NVIDIA, CPU
+and Tensix backends carry on emitting jumps and never notice it
+exists. Relooper-shaped, after Ramsey's "Beyond Relooper" (ICFP
+2022); irreducible CFGs and switch are refused (ok = 0) rather
+than miscompiled, with the switch-dispatch fallback left for a
+later sitting. tests/tstruct.c covers if, if/else, for and while
+with break and continue and checks the output comes out goto-free.
+CI gains a macOS job that builds, runs the suite, then compiles the
+emitted MSL with `xcrun metal` on a real Apple runner, so "it
+emits valid Metal" is checked on every push instead of asserted.
+The Makefile learns to drop GCC-only warning flags and -Werror on
+clang so the macOS build goes through. 282 tests pass; AMD,
+NVIDIA and CPU output is unchanged.
+
 2026-05-29 — 0.5 release. The headline is that you can write a
 Triton kernel, matmul and all, and run it on a CPU with no GPU.
 The CPU backend (`--cpu`) lowers BIR straight to x86-64
