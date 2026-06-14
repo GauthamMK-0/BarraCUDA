@@ -6,13 +6,7 @@ This project originally started because I wanted to run CUDA on my laptop and I 
 
 See [CHANGELOG.txt](CHANGELOG.txt) for recent updates.
 
-**update**: HIP is now being supported.
-
-**update 2**: Triton is now being supported as well.
-
-**update 3**: Native RV32IM codegen for Tenstorrent Wormhole baby cores via `--rv-elf`, plus a TDF (Tile DataFlow) IR layer above BIR that models L1 placement and NoC arcs as first-class compiler concepts.
-
-**update 4**: there's a CPU backend now (`--cpu`). CUDA and Triton kernels compile to a normal x86 object and just run, no GPU needed. Triton matmul goes the whole way through, `tl.dot` and a K-loop and the lot, so you can mess about with Triton on a laptop.
+**Announcement:** BarraCUDA, at some point, will undergo a name change! if you have any good ideas about the name change please let me know. Now with Triton and HIP added maybe a fish pun about CUDA isn't the best. 
 
 ## What It Does
 
