@@ -1130,6 +1130,33 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             }
 
             uint32_t rt  = ref_type(L, rhs);
+
+            /* Pointer arithmetic. In C `ptr + n` steps n ELEMENTS, not n
+             * bytes, so it has to lower to a GEP (which the backends scale by
+             * the pointee size) rather than a plain add. A raw BIR_ADD treats
+             * the index as bytes and drops everything past the first element in
+             * the wrong place -- subscripts already do the right thing, but
+             * explicit `a + i*8` did not until now. */
+            if (op == TOK_PLUS || op == TOK_MINUS) {
+                int lp = is_ptr_type(L, lt), rp = is_ptr_type(L, rt);
+                if ((lp && !rp) || (op == TOK_PLUS && !lp && rp)) {
+                    uint32_t ptr = lp ? lhs : rhs;
+                    uint32_t idx = lp ? rhs : lhs;
+                    uint32_t pt  = lp ? lt  : rt;
+                    if (op == TOK_MINUS) {  /* ptr - n is ptr + (-n) */
+                        uint32_t it  = ref_type(L, idx);
+                        uint32_t z   = BIR_MAKE_CONST(bir_const_int(L->M, it, 0));
+                        uint32_t neg = emit(L, BIR_SUB, it, 2, 0);
+                        set_op(L, neg, 0, z); set_op(L, neg, 1, idx);
+                        idx = BIR_MAKE_VAL(neg);
+                    }
+                    uint32_t gep = emit(L, BIR_GEP, pt, 2, 0);
+                    set_op(L, gep, 0, ptr);
+                    set_op(L, gep, 1, idx);
+                    return BIR_MAKE_VAL(gep);
+                }
+            }
+
             /* Usual arithmetic conversion: promote both operands
              * to the wider/float type. C says int*double → double,
              * not int*double → garbage. Without this, backends get
@@ -3276,7 +3303,6 @@ static void scan_launches(lower_t *L, uint32_t node)
 
             /* For each function param, check if its type is a template param */
             /* Then look at the corresponding launch arg to deduce */
-            int arg_idx = 0;
             for (int i = 0; i < nfparams && arg; i++) {
                 uint32_t fpt = ND(L, fparam_nodes[i])->first_child;
                 if (fpt && ND(L, fpt)->type == AST_TYPE_SPEC
@@ -3314,7 +3340,6 @@ static void scan_launches(lower_t *L, uint32_t node)
                     }
                 }
                 arg = ND(L, arg)->next_sibling;
-                arg_idx++;
             }
         }
 
