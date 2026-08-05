@@ -360,6 +360,18 @@ static void is_imul(uint32_t idx, const bir_inst_t *I)
     em1((rf == NV_RF_U64) ? NV_MUL_LO_U64 : NV_MUL_LO_U32, d, a, b);
 }
 
+/* High half of a wide product, the workhorse of multi-limb field arithmetic.
+ * PTX has mul.hi natively at both widths, so this is a straight lowering,
+ * shalalalala. */
+static void is_umulhi(uint32_t idx, const bir_inst_t *I)
+{
+    uint8_t rf = bir_rfile(I->type);
+    nv_opnd_t d = map_val(idx, I->type);
+    nv_opnd_t a = rslv(I->operands[0]);
+    nv_opnd_t b = rslv(I->operands[1]);
+    em1((rf == NV_RF_U64) ? NV_MUL_HI_U64 : NV_MUL_HI_U32, d, a, b);
+}
+
 static void is_idiv(uint32_t idx, const bir_inst_t *I)
 {
     nv_opnd_t d = map_val(idx, I->type);
@@ -977,11 +989,13 @@ static void is_atm_store(const bir_inst_t *I)
 static void is_shfl(uint32_t idx, const bir_inst_t *I)
 {
     nv_opnd_t d = map_val(idx, I->type);
-    nv_opnd_t val = rslv(I->operands[0]);
-    nv_opnd_t lane = rslv(I->operands[1]);
+    uint32_t val_op = I->operands[1];
+    uint32_t lane_op = I->operands[2];
+    nv_opnd_t val = rslv(val_op);
+    nv_opnd_t lane = rslv(lane_op);
 
     if (val.kind != NV_MOP_REG)
-        val = mat_const(I->operands[0], NV_RF_U32);
+        val = mat_const(val_op, NV_RF_U32);
 
     uint16_t op;
     switch (I->op) {
@@ -999,7 +1013,8 @@ static void is_shfl(uint32_t idx, const bir_inst_t *I)
 static void is_vote(uint32_t idx, const bir_inst_t *I)
 {
     nv_opnd_t d = map_val(idx, I->type);
-    nv_opnd_t pred = rslv(I->operands[0]);
+    uint32_t pred_op = I->operands[1];
+    nv_opnd_t pred = rslv(pred_op);
 
     if (pred.kind != NV_MOP_REG || pred.rfile != NV_RF_PRED) {
         uint16_t prn = new_vreg(NV_RF_PRED);
@@ -1108,6 +1123,8 @@ static void isel_blk(uint32_t bir_bi)
             is_isub(idx, I); break;
         case BIR_MUL:
             is_imul(idx, I); break;
+        case BIR_UMULHI:
+            is_umulhi(idx, I); break;
         case BIR_SDIV: case BIR_UDIV:
             is_idiv(idx, I); break;
         case BIR_SREM: case BIR_UREM:

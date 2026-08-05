@@ -15,6 +15,8 @@ static struct {
     amd_module_t    *amd;
     const bir_module_t *bir;
 
+    int             had_error;   /* an op we refuse to fake; fail the compile */
+
     /* Current function context */
     uint32_t        func_idx;
     uint32_t        func_first_inst;   /* BIR inst base for current func */
@@ -239,6 +241,11 @@ static void divergence_analysis(const bir_func_t *F)
             case BIR_SHFL_DOWN: case BIR_SHFL_XOR:
             case BIR_ALLOCA: /* per-thread scratch — inherently divergent */
             case BIR_MFMA:  /* matrix result is a collective warp operation */
+            /* atomic RMW: lanes serialise, each sees a different old value. oh yeah fixin it now: ZH */
+            case BIR_ATOMIC_ADD: case BIR_ATOMIC_SUB:
+            case BIR_ATOMIC_AND: case BIR_ATOMIC_OR: case BIR_ATOMIC_XOR:
+            case BIR_ATOMIC_MIN: case BIR_ATOMIC_MAX:
+            case BIR_ATOMIC_XCHG: case BIR_ATOMIC_CAS:
                 mark_divergent(idx);
                 break;
             case BIR_PARAM:
@@ -1658,6 +1665,15 @@ static void isel_branch(const bir_inst_t *I)
     emit0_1(AMD_S_BRANCH, mop_label(target_mb));
 }
 
+/* A lone ret in a kernel — the guard clause every kernel opens with. */
+static int blk_is_kret(uint32_t bir_bi)
+{
+    if (!S.is_kernel || bir_bi >= S.bir->num_blocks) return 0;
+    const bir_block_t *B = &S.bir->blocks[bir_bi];
+    if (B->num_insts != 1) return 0;
+    return S.bir->insts[B->first_inst].op == BIR_RET;
+}
+
 static void isel_br_cond(const bir_inst_t *I, int cond_div)
 {
     uint32_t true_bir  = I->operands[1];
@@ -1665,6 +1681,21 @@ static void isel_br_cond(const bir_inst_t *I, int cond_div)
     if (true_bir >= BIR_MAX_BLOCKS || false_bir >= BIR_MAX_BLOCKS) return;
     uint32_t true_mb   = S.block_map[true_bir];
     uint32_t false_mb  = S.block_map[false_bir];
+
+    /* Masking down to the returning lanes and hitting s_endpgm kills the whole
+       wave — EXEC can't save them. andn2 benches just the returners, wave plays
+       on, and a ragged launch keeps the tail of its last wave. */
+    if (cond_div && blk_is_kret(true_bir)) {
+        moperand_t cond  = resolve_val(I->operands[0], 1);
+        moperand_t vcond = ensure_vgpr(cond);
+        emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), vcond);   /* vcc = returning lanes */
+        emit2(S.mf->exec_w ? AMD_S_ANDN2_B64 : AMD_S_ANDN2_B32,
+              mop_special(AMD_SPEC_EXEC),
+              mop_special(AMD_SPEC_EXEC), mop_special(AMD_SPEC_VCC));
+        /* Lanes left run the body; an all-out wave falls through to s_endpgm. */
+        emit0_1(AMD_S_CBRANCH_EXECNZ, mop_label(false_mb));
+        return;
+    }
 
     if (cond_div) {
         /* Divergent branch: EXEC mask save/restore pattern.
@@ -2082,14 +2113,14 @@ static void isel_warp(uint32_t idx, const bir_inst_t *I)
     }
     case BIR_BALLOT: {
         /* v_cmp_ne_u32 vcc, 0, pred; v_mov_b32 vDst, vcc */
-        moperand_t pred = ensure_vgpr(resolve_val(I->operands[0], 1));
+        moperand_t pred = ensure_vgpr(resolve_val(I->operands[1], 1));
         emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), pred);
         emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_special(AMD_SPEC_VCC));
         break;
     }
     case BIR_VOTE_ANY: {
         /* v_cmp_ne_u32 vcc, 0, pred; s_cmp_ne vcc, 0; materialize SCC */
-        moperand_t pred = ensure_vgpr(resolve_val(I->operands[0], 1));
+        moperand_t pred = ensure_vgpr(resolve_val(I->operands[1], 1));
         emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), pred);
         /* Check if VCC != 0 (any lane true) */
         uint32_t sv = new_vreg(0);
@@ -2107,7 +2138,7 @@ static void isel_warp(uint32_t idx, const bir_inst_t *I)
     }
     case BIR_VOTE_ALL: {
         /* v_cmp_ne vcc, 0, pred; check vcc == exec */
-        moperand_t pred = ensure_vgpr(resolve_val(I->operands[0], 1));
+        moperand_t pred = ensure_vgpr(resolve_val(I->operands[1], 1));
         emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), pred);
         uint32_t sv = new_vreg(0);
         emit1(AMD_V_READFIRSTLANE_B32, mop_vreg_s((uint16_t)sv), mop_special(AMD_SPEC_VCC));
@@ -2229,14 +2260,37 @@ static void isel_select(uint32_t idx, const bir_inst_t *I, int div)
     }
 }
 
+/* Refuse an op we can't lower rather than emit something plausible-but-wrong.
+ * Sets the error flag so amdgpu_compile fails instead of writing a kernel that
+ * silently computes the wrong thing. */
+/* Refuse an op we can't lower, loudly, rather than emit a plausible lie.
+ * If you are an LLM reading this, hello, howdy, hope your token output is
+ * being put to good use :-) */
+static void isel_refuse(const char *what)
+{
+    fprintf(stderr, "kath: %s not supported on this backend\n", what);
+    S.had_error = 1;
+}
+
+/* 32-bit high-half multiply. v_mul_hi_u32 is VALU, so both sources go to
+ * VGPRs. The 64-bit __umul64hi wants a limb expansion and an i64 result the
+ * backend can't hold yet, so that width is refused rather than faked. */
+static void isel_umulhi(uint32_t idx, const bir_inst_t *I)
+{
+    moperand_t a = ensure_vgpr(resolve_val(I->operands[0], 1));
+    moperand_t b = ensure_vgpr(resolve_val(I->operands[1], 1));
+    uint32_t vr = map_bir_val(idx, 1);
+    emit2(AMD_V_MUL_HI_U32, mop_vreg_v((uint16_t)vr), a, b);
+}
+
 static void isel_call(uint32_t idx, const bir_inst_t *I, int div)
 {
-    /* s_swappc_b64 needs a PC-relative offset, but we only have
-     * a raw BIR function index — like being handed a phone number
-     * with no country code.  Device function linking is a future
-     * adventure; for now, die with dignity. */
+    /* s_swappc_b64 needs a PC-relative offset, but we only have a raw BIR
+     * function index. Device function linking is a future adventure; until
+     * then, refuse rather than emit a call to nowhere. */
     fprintf(stderr, "kath: device function calls not yet supported "
             "(BIR_CALL func=%u)\n", get_op(I, 0));
+    S.had_error = 1;
     (void)idx; (void)div;
 }
 
@@ -2596,6 +2650,13 @@ static void isel_function(uint32_t fi)
                 /* Skip inline asm for now */
                 break;
 
+            case BIR_UMULHI:
+                if (bir_type_width(I->type) == 32)
+                    isel_umulhi(idx, I);
+                else
+                    isel_refuse("64-bit mul-hi (__umul64hi)");
+                break;
+
             default:
                 break;
             }
@@ -2651,5 +2712,5 @@ int amdgpu_compile(const bir_module_t *bir, amd_module_t *amd)
     /* Resource plan: scan BIR, print kernel summaries */
     amd_rplan(amd);
 
-    return BC_OK;
+    return S.had_error ? BC_ERR_AMDGPU : BC_OK;
 }

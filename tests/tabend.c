@@ -48,6 +48,24 @@ static void ab_init_def(void)
 }
 TH_REG("abend", ab_init_def)
 
+/* Arms and confirms the flag; can't actually raise a fault in-process
+ * without terminating the test. Real behaviour is exercised by the
+ * --cpu launcher when a kernel goes sideways. */
+static void ab_arm_cpu_ok(void)
+{
+    ab_ctx_t *A = calloc(1, sizeof(ab_ctx_t));
+    CHECK(A != NULL);
+    ab_init(A, NULL);
+    int rc = ab_arm_cpu(A);
+    CHEQ(rc, 0);
+    CHEQ(A->armed, 1);
+    ab_shut(A);
+    CHEQ(A->armed, 0);
+    free(A);
+    PASS();
+}
+TH_REG("abend", ab_arm_cpu_ok)
+
 static void ab_trak_one(void)
 {
     ab_ctx_t *A = calloc(1, sizeof(ab_ctx_t));
@@ -308,6 +326,41 @@ static void ab_dump_disp(void)
     PASS();
 }
 TH_REG("abend", ab_dump_disp)
+
+static void ab_dump_snap(void)
+{
+    ab_ctx_t *A = calloc(1, sizeof(ab_ctx_t));
+    CHECK(A != NULL);
+    ab_init(A, NULL);
+    A->code = AB_G0C4;
+
+    /* Distinctive bytes so we can see them in the hex + ASCII gutter. */
+    bc_kernel_t k;
+    memset(&k, 0, sizeof(k));
+    k.kernarg_size = 24;
+    uint8_t args[24] = {
+        0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78,
+        'H','e','l','l','o',' ','k','a', 't','h','!',0,0,0,0,0
+    };
+    ab_snag(A, &k, "snap_demo", "cpu",
+            1, 1, 1, 1, 1, 1, args, 24);
+
+    int n = ab_snap(A, obuf, (int)sizeof(obuf));
+    CHECK(n > 0);
+    CHECK(strstr(obuf, "SNAP") != NULL);
+    CHECK(strstr(obuf, "+0000") != NULL);          /* offset gutter */
+    CHECK(strstr(obuf, "+0010") != NULL);          /* second row */
+    CHECK(strstr(obuf, "DEADBEEF") != NULL);       /* hex row 0 */
+    CHECK(strstr(obuf, "74682100") != NULL);       /* hex row 1 */
+    /* ASCII gutter splits at 16B, so "Hello kath!" is never contiguous. */
+    CHECK(strstr(obuf, "Hello ka") != NULL);
+    CHECK(strstr(obuf, "th!") != NULL);
+
+    ab_shut(A);
+    free(A);
+    PASS();
+}
+TH_REG("abend", ab_dump_snap)
 
 static void ab_dump_smap(void)
 {

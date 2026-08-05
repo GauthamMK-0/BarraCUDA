@@ -6,11 +6,11 @@ This is the bit where I admit I read a pile of z/OS manuals and got a little obs
 
 ## ABEND dumps
 
-When a kernel faults you get a real dump, not a shrug. `src/runtime/bc_abend.*` gives GPU faults proper IBM-style completion codes (G0Cx, the GPU cousins of S0Cx), correlates the faulting address against tracked allocations, and prints a dispatch snapshot. It's wired into the HSA runtime and fires automatically off the system event callback, so a memory aperture violation tells you which buffer and which dispatch went wrong instead of just dying quietly. Live on the AMD/HSA path.
+When a kernel faults you get a real dump, not a shrug. `src/runtime/bc_abend.*` gives GPU faults proper IBM-style completion codes (G0Cx, the GPU cousins of S0Cx), correlates the faulting address against tracked allocations, and prints a dispatch snapshot. It's wired into the HSA runtime and fires automatically off the system event callback, so a memory aperture violation tells you which buffer and which dispatch went wrong instead of just dying quietly. Live on the AMD/HSA path and, via `ab_arm_cpu`, on `--cpu` kernels too: POSIX `sigaction` on SIGSEGV/SIGILL/SIGFPE/SIGBUS, or a Windows unhandled-exception filter, mapped onto the same G0Cx taxonomy so a segfault in a `--cpu` kernel looks like an AMD one.
 
 ## SNAP (`--snap`)
 
-A parameter dump, basically. The mainframe crowd had this in the 70s and I kept wishing for it while debugging. With `--snap` the AMD backend writes each kernel parameter's register value into a host-visible buffer on entry, so when things go sideways you can read the evidence instead of staring at disassembly like it owes you money. AMD only for now.
+A parameter dump, basically. The mainframe crowd had this in the 70s and I kept wishing for it while debugging. With `--snap` the AMD backend writes each kernel parameter's register value into a host-visible buffer on entry, so when things go sideways you can read the evidence instead of staring at disassembly like it owes you money. The AMD compiler-side instrumentation is AMD-only; on every backend the ABEND dump also renders the launcher-side kernarg block (captured by `ab_snag`) as a hex+ASCII SNAP section, so `--cpu`, NVIDIA, and Tensix all get "here are the argument bytes the kernel actually saw" for free.
 
 ## SYSPRINT
 
@@ -36,7 +36,7 @@ bc_sp_register_sink("DEMO.RESULT", my_sink, NULL);
 bc_sp_drain(&buf);                                 /* sinks fire */
 ```
 
-See `examples/sysprint_kernel.cu` + `examples/launch_sysprint.c` for a full end-to-end demo. Works on the NVIDIA PTX and Tensix backends; the AMD path currently trips a regalloc bug on the byte-copy loop ([open issue](https://github.com/Zaneham/Booth/issues)), which gets its own follow-up.
+See `examples/sysprint_kernel.cu` + `examples/launch_sysprint.c` for a full end-to-end demo. Works on the AMD, NVIDIA PTX and Tensix backends.
 
 ## TDF (Tile DataFlow)
 
