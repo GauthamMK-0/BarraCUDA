@@ -6,9 +6,10 @@ It is named to honour Kathleen Booth: creator of the first assembly language, co
 
 A running log of what's changed is in [CHANGELOG.md](CHANGELOG.md).
 
-**Update:** Fortran `do concurrent` kernels now compile to AMD, NVIDIA and
-x86-64 through LFortran, checked against SLATEC values in CI. See
-[Using Fortran](docs/usage.md#fortran).
+**Update:** `--mlir` reads MLIR text, with no LLVM anywhere in the path.
+`func.func` and the `arith` dialect lower to BIR and go down the same pipeline
+CUDA and Triton use. It is a small subset on purpose, and anything outside it
+is named and refused rather than skipped. See [Using MLIR](docs/usage.md#mlir).
 
 ## What It Does
 
@@ -16,9 +17,25 @@ Takes CUDA C, HIP, or Triton source (the same files you'd hand to `nvcc`, `ROCm`
 
 That last one still surprises me a bit. You can write a Triton kernel, matmul and all, and run it on a machine that's never seen a GPU, from scratch, no LLVM, straight to native. I haven't come across anyone else doing Triton like this, but I'd happily be proven wrong, so give me a yell if you've seen it somewhere.
 
+Fortran `do concurrent` kernels go down the same path through
+[LFortran](https://lfortran.org/), checked against SLATEC values in CI. See
+[Using Fortran](docs/usage.md#fortran).
+
 It also borrows a pile of operational discipline from the mainframe world: real crash dumps when a kernel faults, structured output routed by class, parameter snapshots on entry. See [docs/mainframe.md](docs/mainframe.md) if that sounds like your kind of thing.
 
+## Getting it
+
+If you're lazy like me and just want to run and go, then you can install it [here](https://github.com/Zaneham/Booth/releases/latest). It comes with no dependencies and you don't have to run `make` to use it. There's a build for Linux, macOS and Windows.
+
+```bash
+tar xzf booth-*-linux-x86_64.tar.gz
+cd booth-*-linux-x86_64
+./kath --version
+```
+
 ## Build
+
+If you'd rather build it, or you're on something I don't ship a binary for:
 
 ```bash
 make
@@ -36,6 +53,7 @@ The binary is `kath` (after Kathleen but if she picked Australia or New Zealand 
 ## Documentation
 
 - **[Usage](docs/usage.md)** — every backend, every flag, and the runtime launcher
+- **[CMake](docs/cmake.md)** — installing Booth and compiling kernels from a CMake project
 - **[Feature status](docs/features.md)** — what compiles today, and what doesn't yet
 - **[Mainframe curios](docs/mainframe.md)** — ABEND dumps, SNAP, SYSPRINT, TDF
 - **[Validated hardware](docs/hardware.md)** — the silicon it's been tested on, and the test suite
@@ -65,6 +83,8 @@ Based in New Zealand, where it's already tomorrow and the GPUs are just as confu
 ## Acknowledgements
 
 - **Fernando Magno Quintão Pereira** and the **Compilers Lab at UFMG** (Universidade Federal de Minas Gerais). Fernando reached out after seeing the project, pointed me to the divergence analysis papers, and offered guidance. The SSA register allocator exists because of that conversation.
+- **[Jorge Galvez](https://github.com/JorgeG94)** for sending me his `do concurrent` Fortran benchmarks and letting me run tests on them. Three real frontend bugs turned up in an afternoon, which is exactly what you want somebody else's code to do.
+- **Jon Stevens** from Hot Aisle who has very generously supported this compiler by providing access to AMD CDNA GPUs. You can find more about Hot Aisle [here](https://hotaisle.xyz/).
 - **The academic community**: Cooper, Harvey & Kennedy for dominators; Braun & Hack for SSA spilling; Sampaio, Souza, Collange & Pereira for divergence analysis. I'm just a hobbyist who reads papers and writes C. The actual hard work was done by the researchers.
 - **Steven Muchnick** for *Advanced Compiler Design and Implementation*. If this compiler does anything right, that book is why.
 - **Low Level** for the Zero to Hero C course and the YouTube channel. That's where I learnt C.

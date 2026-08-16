@@ -5,17 +5,26 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---- Version ---- */
-#define BC_VERSION_MAJOR    5
-#define BC_VERSION_MINOR    1
-#define BC_VERSION_PATCH    0
-#define BC_VERSION_STRING   "5.01"
+/* Bounded loops and checked indices. The arena goes unused here, since Booth
+ * allocates once per phase and never in a hot path. */
+#include "kauri.h"
+
+/* ---- Version ----
+ * The 0.5 release was tagged v5.01, which was a typo for 0.5.1 and made the
+ * compiler look four major versions further along than it is. Corrected here;
+ * everything downstream derives from these three numbers. */
+#define BC_VERSION_MAJOR    0
+#define BC_VERSION_MINOR    5
+#define BC_VERSION_PATCH    2
+#define BC_VERSION_STRING   "0.5.2"
 
 /* The universe has limits. So do our buffers. No malloc, no madness. */
 #define BC_MAX_SOURCE       (4 * 1024 * 1024)
 #define BC_MAX_TOKENS       (1 << 20)
 #define BC_MAX_IDENT        256
 #define BC_MAX_ERRORS       64
+/* Arguments in one call. Real ocean kernels pass 23, so 16 was not enough. */
+#define BC_MAX_ARGS         64
 #define BC_MAX_PATH         512
 #define BC_MAX_DEPTH        256
 #define CUDA_GLOBAL         0x0001

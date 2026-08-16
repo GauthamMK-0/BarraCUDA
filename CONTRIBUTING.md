@@ -22,6 +22,32 @@ Booth is written in a defensive C99 style. I spent too much time staring at NASA
 
 **No floats where integers will do.** If you're comparing ratios, cross-multiply. Floating point is for GPU shader maths, not compiler internals.
 
+### Kauri
+
+Three of those rules used to be things I just tried to remember. Now there are macros for them. `barracuda.h` pulls in [Kauri](https://github.com/Zaneham/kauri), so they're already available anywhere in the tree and you don't need to include anything.
+
+```c
+/* Bounded loop. g counts down, so a cone that won't converge stops
+ * instead of hanging. Pick a bound you can justify. */
+KA_GUARD(g, 64);
+while (changed && g--) {
+    changed = fold_once(M);
+}
+
+/* Untrusted index. Returns 1 when out of bounds, so it reads as
+ * "if that's rubbish, refuse". Internal bookkeeping doesn't need it. */
+if (KA_CHK(idx, M->num_insts)) return BC_ERR_VERIFY;
+
+/* Pool allocation. Index 0 is the sentinel, so 0 means the pool is
+ * full. Pass the sentinel upwards rather than winding the counter back. */
+uint32_t ni = KA_PNEW(M->num_insts, BIR_MAX_INSTS);
+if (ni == 0) return 0;
+```
+
+Most of the existing code was written before these existed, so there's plenty that could use them. If you're reading a file and spot a loop that could take a guard, or an index coming in from outside that isn't checked, a PR is very welcome. If you're not sure whether a particular one wants it, raise an issue and we can work it out, that's a more interesting conversation than it sounds.
+
+Two things worth knowing. `KA_PNEW` evaluates its counter twice, so give it a plain lvalue and nothing with side effects. And Kauri has an arena allocator and a result type that Booth doesn't use, since allocation happens once per phase and errors come back as `BC_ERR_*`, so there's no need to reach for `KA_TRY`.
+
 ### Naming
 
 Function and variable names are short, 4-7 characters. Think of it like reading a motorway sign at 100km/h, you want "SH1 NORTH" not "STATE_HIGHWAY_ONE_NORTHBOUND_DIRECTION". When you're reading a thousand lines of instruction selector at 2am you want `ra_gc` not `regalloc_graphcolor`. Look at the newer code for the pattern: `isel_emit`, `mk_hash`, `enc_vop3`, `xt_meta`, `dce_copy`.
@@ -133,13 +159,51 @@ Tenstorrent additionally sits above BIR through TDF (Tile DataFlow), a small IR 
 # Build
 make
 
-# Run the test suite (currently 274 tests across the frontends,
+# Run the test suite (currently 390 tests across the frontends,
 # IR, backends, runtime, and SYSPRINT)
 make test
+
+# List the families, or run just one of them
+./trunner --families
+./trunner --fam rvi
+./trunner --list
 
 # Run the emulator test suite (RDNA3, requires tinygrad mockgpu in WSL)
 python tests/emu/run_emu.py
 ```
+
+### Test naming
+
+Tests are named for their family and their position in it, `rvi01`, `tdf39`,
+`smk04`, which is lifted straight off z390's `rt\test` directory where the
+members run `TESTDCB1` through `TESTDCB9`. It is a bit cargo-culted from the
+mainframe world and the eight character member limit it comes from stopped
+mattering decades ago, but an alphabetical listing groups and orders itself,
+grep agrees with the runner about what comes first, and nothing drifts.
+
+The family is the file stem and there is one family per file. `trv_isel.c`
+carries `rvi`, `ttdf.c` carries `tdf`. Add a test with:
+
+```c
+static void rvi66(void) { ...; PASS(); }
+TH_REG("rvi", 66, "what it checks, in a phrase", rvi66)
+```
+
+The name says nothing on its own, so the description carries it and shows up in
+`--list` and in the run. Keep it inside `TH_DESCW`. Every family has to appear
+in `fam_order` in `tests/tmain.c`, which is also where the running order lives,
+and `th_check` refuses to run if a name, number or family does not line up.
+That check exists because 278 of the tests used to register under families the
+runner had never heard of, where `--list` could not see them and `--cat` could
+not reach them.
+
+Regression tests for bugs that actually shipped go in `tests/trpi.c` with the
+issue number leading the description, z390's `RPI1540` habit with our numbering.
+
+`.cu` fixtures may carry a sidecar `tests/NAME.opt` declaring modes they are
+known not to survive, one `xfail MODE reason` per line. `make repro` requires
+every other mode to compile twice to identical bytes, and it reports an `xfail`
+that starts passing as well, so a stale exception does not hide a fix.
 
 Verify your changes don't introduce encoding regressions:
 ```bash

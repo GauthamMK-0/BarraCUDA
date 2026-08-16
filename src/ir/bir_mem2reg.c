@@ -145,8 +145,10 @@ static uint32_t make_undef(bir_module_t *M, uint32_t type)
         if (M->consts[i].kind == BIR_CONST_UNDEF && M->consts[i].type == type)
             return BIR_MAKE_CONST(i);
     }
-    if (M->num_consts >= BIR_MAX_CONSTS)
+    if (M->num_consts >= BIR_MAX_CONSTS) {
+        bir_pfull(M, BIR_P_CONSTS);
         return BIR_VAL_NONE;
+    }
     uint32_t ci = M->num_consts++;
     M->consts[ci].kind = BIR_CONST_UNDEF;
     memset(M->consts[ci].pad, 0, sizeof(M->consts[ci].pad));
@@ -468,8 +470,16 @@ static void step5_insert_phis(m2r_t *S)
                 if (has_phi[d]) continue;
                 has_phi[d] = 1;
 
-                if (M->num_insts >= BIR_MAX_INSTS) continue;
-                if (S->num_phis >= M2R_MAX_PHIS) continue;
+                /* A skipped phi is a wrong value at the join, not a lost
+                   optimisation. */
+                if (M->num_insts >= BIR_MAX_INSTS) {
+                    bir_pfull(M, BIR_P_INSTS);
+                    continue;
+                }
+                if (S->num_phis >= M2R_MAX_PHIS) {
+                    bir_pfull(M, BIR_P_PHIS);
+                    continue;
+                }
 
                 uint32_t phi_idx = M->num_insts++;
                 bir_inst_t *phi = &M->insts[phi_idx];
@@ -498,6 +508,7 @@ static void step5_insert_phis(m2r_t *S)
                         M->extra_operands[M->num_extra_ops++] = BIR_VAL_NONE;
                     }
                 } else {
+                    bir_pfull(M, BIR_P_EXTRAOPS);
                     M->num_insts--;
                     continue;
                 }
@@ -746,11 +757,15 @@ static void step7_compact(m2r_t *S)
     /* Second pass: copy instructions into new positions.
      * Use a static scratch buffer to avoid overlap issues. */
     static bir_inst_t scratch[BIR_MAX_INSTS];
+    /* Lines travel with their instructions or they end up describing
+     * whatever landed in the slot instead. */
+    static uint32_t scratch_lines[BIR_MAX_INSTS];
     uint32_t si = 0;
 
     for (uint32_t bi = 0; bi < S->num_blocks; bi++) {
         for (int pi = 0; pi < S->num_phis; pi++) {
             if (S->phis[pi].block != bi) continue;
+            scratch_lines[si] = M->inst_lines[S->phis[pi].inst];
             scratch[si++] = M->insts[S->phis[pi].inst];
         }
         uint32_t abs_b = S->base_block + bi;
@@ -758,12 +773,15 @@ static void step7_compact(m2r_t *S)
         for (uint32_t j = 0; j < B->num_insts; j++) {
             uint32_t ii = B->first_inst + j;
             if (S->dead[ii]) continue;
+            scratch_lines[si] = M->inst_lines[ii];
             scratch[si++] = M->insts[ii];
         }
     }
 
     /* Copy scratch back */
     memcpy(&M->insts[S->base_inst], scratch, si * sizeof(bir_inst_t));
+    memcpy(&M->inst_lines[S->base_inst], scratch_lines,
+           si * sizeof(scratch_lines[0]));
 
     /* Update block boundaries */
     uint32_t cursor = S->base_inst;
@@ -921,6 +939,8 @@ int bir_mem2reg(bir_module_t *M)
             /* Move instructions */
             memmove(&M->insts[dst], &M->insts[src],
                     count * sizeof(bir_inst_t));
+            memmove(&M->inst_lines[dst], &M->inst_lines[src],
+                    count * sizeof(M->inst_lines[0]));
 
             /* Update block boundaries */
             for (uint16_t bi = 0; bi < F->num_blocks; bi++) {

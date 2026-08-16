@@ -5,6 +5,184 @@ Booth — Changelog
 
 ### Frontend
 
+- `kath --mlir` reads MLIR text, no LLVM in the path. Čertík's pure-C
+  reader vendored under `src/mlir/vendor` (mlir 826b69c9, corec a160199d),
+  reached only through `src/mlir/mlir_fe.c` (Zane Hambly, 2026-08-11)
+
+- `src/mlir/lower.c` walks the parsed module into BIR: `func.func`, `return`,
+  `arith.constant` and every arith binop, compare and conversion the reader
+  classifies. From there it is the pipeline CUDA and Triton already use, and
+  MLIR reaches all four backends. `--mlir --pp` reprints instead
+  (Zane Hambly, 2026-08-11)
+
+- an op outside the subset stops the lowering and names itself. Skipping it
+  would leave a function that compiles and computes something else
+  (Zane Hambly, 2026-08-11)
+
+- five fixes to the vendored reader, all worth upstreaming, and four of them
+  are `func.func` being unfinished where `tt.func` is not: `parser_init`
+  renamed off Booth's own, `parser_error`'s `exit(1)` replaced by a
+  `mlir_parse_fail()` the linker supplies, `func.func` binding its arguments
+  before parsing the body rather than after, `func.func` accepting the
+  `attributes` clause where MLIR actually writes it, and `arith.xori`,
+  `shli` and `shrsi` added to `op_string_to_type`, which the printer could
+  already write but the parser could not read back
+  (Zane Hambly, 2026-08-11)
+
+- `ml_parse` resets the reader's process-wide type interning, which upstream
+  assumes one context per process. Without it a closed context left the next
+  parse in freed memory (Zane Hambly, 2026-08-11)
+
+- the Triton lowering records pool overflow through `bir_pfull`, which the C99
+  one already did and it never has. It answered a full block pool with index 0,
+  a live block, so `bir_pchk` could not see a Triton arena exhaustion at all
+  (Zane Hambly, 2026-08-11)
+
+- Triton blocks are named. String offset 0 is a live string, so a nameless
+  block printed as whatever went into the table first, and all four blocks of
+  a loop kernel were labelled with the kernel's own name
+  (Zane Hambly, 2026-08-11)
+
+### Architecture
+
+- BIR arena writers record a `pool_full` bit rather than returning index 0,
+  which is a live entry and not a sentinel. A full pool emitted wrong
+  immediates under exit 0; `bir_pchk` now refuses (Zane Hambly, 2026-08-11)
+
+- #160: DCE and mem2reg move instructions without moving `inst_lines[]`
+  with them, so every line number past the first deleted instruction
+  pointed at the wrong source. Four sites fixed
+  (Zane Hambly, 2026-08-09)
+
+### Build
+
+- #160: vendor Kauri (MIT) as `src/kauri.h`, included from `barracuda.h`,
+  so `KA_GUARD`, `KA_CHK` and `KA_PNEW` are available tree-wide
+  (Zane Hambly, 2026-08-09)
+
+### CI and tests
+
+- `make mutate` bends one line of Booth at a time in a scratch copy and checks
+  the suite notices, from a table in `tests/mutants.tbl`. Ported from Kahu's
+  (Zane Hambly, 2026-08-12)
+
+- six tests that were not testing what they looked like they were. The `cfd`
+  family could not tell a reversed subtraction from an addition, because both
+  fixtures folded to 7. The only SOP2 encoding test used `s_add_u32`, whose
+  opcode is 0x00, so the opcode field could sit anywhere in the word. The GFX9
+  SMEM branch had no test at all, on a shipping target. `rss` accepted a clean
+  rejection everywhere, so an allocator that rejected everything would have
+  passed. Nothing checked a memory wait waits on the memory counter, or that a
+  plain `func.func` is not a kernel (Zane Hambly, 2026-08-12)
+
+- #160: `make repro` compiles every test file twice under `--amdgpu`,
+  `--nvidia-ptx` and `--ir` and compares the bytes, so the deterministic
+  layout `bir.h` claims is checked rather than assumed
+  (Zane Hambly, 2026-08-09)
+
+- tests are named for their family and position, `rvi01` and `tdf39` rather
+  than `rv_isel_max_frame_slots_in_range`, after z390's `TESTDCB1`. The family
+  is the file stem, the old descriptive name became a description the runner
+  prints, and `fam_order` in `tests/tmain.c` is the one place a family is
+  declared (Zane Hambly, 2026-08-10)
+
+- the runner refuses to start if a test registers an unknown family, a name
+  that disagrees with its number, or a number already taken. 278 of the 380
+  tests were registering under families `cat_order` did not list, so they ran
+  unheaded in link order, `--list` showed 102 of them and `--cat rv_enc` ran
+  none of them while exiting 0 (Zane Hambly, 2026-08-10)
+
+- `--fam` replaces `--cat`, which still works, and `--families` lists the
+  families with their files and counts (Zane Hambly, 2026-08-10)
+
+- the keyword table `lookup_keyword` binary searches is checked for ordering,
+  and every keyword is checked to still lex as a keyword. A misfiled entry lexed
+  as an identifier and surfaced as a parse error somewhere else entirely
+  (Zane Hambly, 2026-08-10)
+
+- `make repro` reads a sidecar `tests/NAME.opt` per fixture instead of counting
+  every refusal as a silent skip. Eight refusals were being hidden, one of them
+  a live `v_mfma` verifier failure, and an `xfail` that starts passing is now
+  reported too (Zane Hambly, 2026-08-10)
+
+- `tests/trpi.c` collects regressions for bugs that shipped, seeded with #160's
+  line-number corruption, which had four sites fixed and no test
+  (Zane Hambly, 2026-08-10)
+
+## 2026-08-07
+
+Version 0.5.2.
+
+First, a correction. The last release went out tagged v5.01, which was
+meant to be 0.5.1 and wasn't, and it left Booth looking four major
+versions further along than it actually is. It isn't. This release puts
+the numbering back where it belongs, and sorry to anyone who pinned the
+old one or took the version at face value. The tag stays where it is so
+nothing breaks underneath you, but the compiler now reports what it is.
+
+The theme this cycle, without meaning to be, was the compiler telling
+the truth. Semantic errors used to be printed and then ignored by every
+mode except `--sema`, so the backend ran on source that had already been
+rejected, wrote an output file and exited zero. Asking for several
+backends at once wrote all of them over the same `-o` path and left you
+whichever finished last, under the name you chose, again exiting zero.
+Metal quietly narrowed a double-precision kernel to float and said
+nothing, which is a real problem if you were counting on the precision.
+`--amdgpu` ignored `-o` entirely and mixed a diagnostic into the
+assembly on stdout. All four are fixed, and all four had been sitting
+there being cheerfully wrong for a while.
+
+The structural change is the backend contract. Every target now sits
+behind a `be_desc_t` and registers itself in one list, and a backend
+owns its own command line rather than reaching into a shared config
+struct and the driver's argument loop. Adding a target used to mean
+reading 420 KB of AMD backend to work out what was expected; now it
+means reading one header and copying the skeleton. `main.c` lost about
+a third of its length in the process, and the frontend stopped needing
+to know what an AMD target enum is.
+
+Booth also installs now. `make install` puts `kath`, the message
+catalogues and a CMake package config into a prefix, so a downstream
+project can `find_package(Booth)` and compile kernels as part of its own
+build with `booth_add_kernel()`. There is a worked example under
+`examples/cmake/` and CI builds it against a staged install on every
+push, along with a check that the target list in the package config
+hasn't drifted from what the backends actually accept.
+
+Getting Booth no longer requires being able to build it. Every release
+now carries prebuilt binaries for Linux, macOS and Windows, statically
+linked so they have no runtime dependencies whatsoever, with checksums.
+Unpack and run. This mattered more than I realised: the Windows build
+had been quietly depending on MinGW's `libssp-0.dll`, so handing someone
+the binary would not have worked on a machine without a toolchain, which
+is exactly the machine they wanted it for.
+
+There are coverage numbers for the first time, 74.1% of lines and 58.4%
+of branches, reported by CI on every PR. That immediately turned up the
+SSA register allocator having never been executed by a test at all, and
+the six fixtures now pinning its behaviour also pin a real bug in it,
+which is at least honest.
+
+Thanks to Jorge Galvez, whose do-concurrent ocean benchmarks found three
+genuine frontend bugs in an afternoon, and who let me test against his
+code. Thanks to @maou3434 for the bare HIP warp and lane intrinsics,
+which is their first contribution here and a very welcome one. And
+thanks to @FileDelta for asking a simple question about the runtimes
+that turned over considerably more than either of us expected.
+
+### Frontend
+
+- double-precision `fmax`, `fmin` and `fmod`. The ocean kernels in
+  [Jorge Galvez](https://github.com/JorgeG94)'s do-concurrent benchmarks call
+  them, and only the `f`-suffixed single-precision forms were recognised
+  (Zane Hambly, 2026-08-06)
+
+- raise the cap on arguments in one call to 64, and say so when a call goes
+  past it. Sema stopped counting at 16 and then reported an arity mismatch
+  against the count it had stopped at, so a correct 23-argument call in the
+  same ocean benchmarks was rejected and told the wrong number
+  (Zane Hambly, 2026-08-06)
+
 - #142: parse function pointer declarators, and constructors and destructors
   (Zane Hambly, 2026-07-27)
 
@@ -29,6 +207,21 @@ Booth — Changelog
 - #137: support bare convergent warp and lane intrinsics
   (Maou, 2026-07-27)
 
+### Architecture
+
+- one target per run. Several backends at once all wrote to the same
+  `-o` path, so you got whichever came last in the registry under the
+  name you asked for, and a zero exit
+
+- backend contract (`be_desc_t`) with static registration; every
+  existing backend sits behind the same shape and the driver iterates
+  `be_list` instead of the copy-pasted if-chain. A backend also owns its
+  own command line now, so adding a target means one file and one line in
+  the list rather than editing a shared config struct and the driver's
+  argument loop. Skeleton in `src/backend/skeleton/` and
+  `docs/backends.md` for anyone adding a target
+  (Zane Hambly, 2026-08-02)
+
 ### Backends
 
 - seed atomic RMW as divergent in the AMD divergence analysis, so a GEP off
@@ -40,9 +233,19 @@ Booth — Changelog
   where it cannot be done
   (Zane Hambly, 2026-07-26)
 
+- metal: refuse a kernel that uses `double` rather than narrowing it to
+  `float`. Apple GPUs have no fp64, and quietly halving the precision the
+  source asked for is worse than saying so
+  (Zane Hambly, 2026-08-06)
+
 - a divergent return masks lanes instead of ending the wave, so AMD kernels
   no longer lose the lanes that did not take the branch
   (Zane Hambly, 2026-07-25)
+
+- `--amdgpu` honours `-o`, and the register-plan line goes to stderr rather
+  than into the middle of the assembly on stdout, where it stopped the result
+  assembling
+  (Zane Hambly, 2026-08-06)
 
 ### Tensix
 
@@ -79,6 +282,11 @@ Booth — Changelog
 
 ### Driver
 
+- semantic errors fail the compile. Every mode but `--sema` printed them and
+  then carried on into codegen, wrote an output file and exited zero, so a
+  build system saw a clean compile of source we had already rejected
+  (Zane Hambly, 2026-08-06)
+
 - collapse the C99 mode gates into one cascade
   (Zane Hambly, 2026-07-23)
 
@@ -99,6 +307,18 @@ Booth — Changelog
   the linker a mix of COFF and ELF
   (Zane Hambly, 2026-07-28)
 
+- `make install`, honouring `PREFIX` and `DESTDIR`, and a CMake package config
+  alongside it, so a downstream project can `find_package(Booth)` and build
+  kernels with `booth_add_kernel()`
+  (Zane Hambly, 2026-08-06)
+
+- prebuilt binaries on every release for Linux, macOS and Windows, statically
+  linked where the platform allows it so they carry no runtime dependencies,
+  with SHA256 checksums. The Windows build previously needed MinGW's
+  `libssp-0.dll` present, which made the binary useless to anyone without a
+  toolchain
+  (Zane Hambly, 2026-08-07)
+
 ### CI and tests
 
 - #140: numeric regression against SLATEC known-good values, across cpu,
@@ -114,6 +334,16 @@ Booth — Changelog
 
 - guard the divergent-return lowering against regressing to `s_endpgm`
   (Zane Hambly, 2026-07-26)
+
+- #154: `make coverage` builds an instrumented tree and reports line coverage
+  via gcovr, with a CI job that posts the summary and uploads the HTML
+  (Zane Hambly, 2026-08-02)
+
+- #154: cover the SSA register allocator, which had never been run by a test.
+  Six fixtures and any `--max-vgprs` below 8 leave virtual registers
+  unallocated under `--ssa-ra`; those are pinned in `tests/tra_ssa.c` until
+  the allocator is fixed
+  (Zane Hambly, 2026-08-02)
 
 ### Documentation
 
@@ -138,7 +368,8 @@ Booth — Changelog
 
 ## 2026-07-14
 
-Version 5.01. So long, and thanks for all the fish.
+Version 5.01, which should have read 0.5.1. See the 0.5.2 note above.
+So long, and thanks for all the fish.
 BarraCUDA was a good pun and a bad description, so it swam off: the
 compiler is Booth now, the binary is `kath`, and the version jumps
 to mark the line. First release under the new name; the rename note

@@ -1,5 +1,4 @@
 #include "bir_lower.h"
-#include "../amd_target_defs.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -298,7 +297,10 @@ static void op_name_from_tok(int tok, char *out, int outsz)
 static uint32_t emit(lower_t *L, uint16_t op, uint32_t type,
                      uint8_t nops, uint8_t subop)
 {
-    if (L->M->num_insts >= BIR_MAX_INSTS) return 0;
+    if (L->M->num_insts >= BIR_MAX_INSTS) {
+        bir_pfull(L->M, BIR_P_INSTS);
+        return 0;
+    }
     uint32_t idx = L->M->num_insts++;
     bir_inst_t *I = &L->M->insts[idx];
     memset(I, 0, sizeof(*I));
@@ -315,6 +317,9 @@ static uint32_t emit(lower_t *L, uint16_t op, uint32_t type,
 
 static void set_op(lower_t *L, uint32_t inst, int slot, uint32_t val)
 {
+    /* emit answers 0 on a full pool, and inst 0 is real. Don't write it. */
+    if (inst >= L->M->num_insts) return;
+    if (slot < 0 || slot >= BIR_OPERANDS_INLINE) return;
     L->M->insts[inst].operands[slot] = val;
 }
 
@@ -322,7 +327,10 @@ static void set_op(lower_t *L, uint32_t inst, int slot, uint32_t val)
 
 static uint32_t new_block(lower_t *L, const char *name)
 {
-    if (L->M->num_blocks >= BIR_MAX_BLOCKS) return 0;
+    if (L->M->num_blocks >= BIR_MAX_BLOCKS) {
+        bir_pfull(L->M, BIR_P_BLOCKS);
+        return 0;
+    }
     uint32_t idx = L->M->num_blocks++;
     bir_block_t *B = &L->M->blocks[idx];
     B->name = bir_add_string(L->M, name, (uint32_t)strlen(name));
@@ -789,7 +797,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
 
         /* Builtin constant: warpSize (HIP) */
         if (strcmp(name, "warpSize") == 0 && L->sema) {
-            int wave_size = amd_get_wave_size(L->sema->amd_target);
+            int wave_size = L->sema->warp_size;
             uint32_t t = bir_type_int(L->M, 32);
             return BIR_MAKE_CONST(bir_const_int(L->M, t, wave_size));
         }
@@ -1410,7 +1418,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 {"atomicMax", BIR_ATOMIC_MAX}, {"atomicExch",BIR_ATOMIC_XCHG},
             };
             int matched = 0;
-            for (int bi = 0; bi < 8; bi++) {
+            for (int bi = 0; bi < (int)(sizeof atab / sizeof atab[0]); bi++) {
                 if (strcmp(cname, atab[bi].n) != 0) continue;
                 uint32_t an = ND(L, callee_n)->next_sibling;
                 uint32_t a0 = lower_expr(L, an);
@@ -1470,7 +1478,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 {"__shfl_down",      BIR_SHFL_DOWN,0},
                 {"__shfl_xor",       BIR_SHFL_XOR, 0},
             };
-            for (int bi = 0; bi < 8; bi++) {
+            for (int bi = 0; bi < (int)(sizeof stab / sizeof stab[0]); bi++) {
                 if (strcmp(cname, stab[bi].n) != 0) continue;
                 uint32_t sa[4];
                 int sn = 0;
@@ -1502,7 +1510,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 {"__any",         BIR_VOTE_ANY, 0},
                 {"__all",         BIR_VOTE_ALL, 0},
             };
-            for (int bi = 0; bi < 6; bi++) {
+            for (int bi = 0; bi < (int)(sizeof vtab / sizeof vtab[0]); bi++) {
                 if (strcmp(cname, vtab[bi].n) != 0) continue;
                 uint32_t an = ND(L, callee_n)->next_sibling;
                 uint32_t a0, a1;
@@ -1672,7 +1680,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 {"floorf",BIR_FLOOR},{"ceilf",BIR_CEIL},
                 {"truncf",BIR_FTRUNC},{"roundf",BIR_RNDNE},{"rintf",BIR_RNDNE},
             };
-            for (int mi = 0; mi < 16; mi++) {
+            for (int mi = 0; mi < (int)(sizeof mt1 / sizeof mt1[0]); mi++) {
                 if (strcmp(cname, mt1[mi].n) != 0) continue;
                 uint32_t an = ND(L, callee_n)->next_sibling;
                 uint32_t v = lower_expr(L, an);
@@ -1687,8 +1695,9 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
         {
             static const struct { const char *n; uint16_t op; } mt2[] = {
                 {"fmaxf",BIR_FMAX},{"fminf",BIR_FMIN},{"fmodf",BIR_FREM},
+                {"fmax",BIR_FMAX},{"fmin",BIR_FMIN},{"fmod",BIR_FREM},
             };
-            for (int mi = 0; mi < 3; mi++) {
+            for (int mi = 0; mi < (int)(sizeof mt2 / sizeof mt2[0]); mi++) {
                 if (strcmp(cname, mt2[mi].n) != 0) continue;
                 uint32_t an = ND(L, callee_n)->next_sibling;
                 uint32_t a0 = lower_expr(L, an);
@@ -1861,7 +1870,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 {"f64_16x16x4f64",      21},
             };
             const char *sfx = cname + 22;
-            for (int mi = 0; mi < 22; mi++) {
+            for (int mi = 0; mi < (int)(sizeof mfma_tab / sizeof mfma_tab[0]); mi++) {
                 if (strcmp(sfx, mfma_tab[mi].sfx) != 0) continue;
                 /* 3 args: A, B, C(accum) */
                 uint32_t an = ND(L, callee_n)->next_sibling;
@@ -1888,7 +1897,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 {"num_groups", BIR_GRID_DIM},
             };
             const char *rest = cname + 11;
-            for (int oi = 0; oi < 4; oi++) {
+            for (int oi = 0; oi < (int)(sizeof ockl / sizeof ockl[0]); oi++) {
                 if (strcmp(rest, ockl[oi].sfx) != 0) continue;
                 /* arg is literal dim (0/1/2) */
                 uint32_t an = ND(L, callee_n)->next_sibling;
@@ -1913,7 +1922,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 {"floor", 5, BIR_FLOOR}, {"ceil",  4, BIR_CEIL},
                 {"trunc", 5, BIR_FTRUNC},{"rint",  4, BIR_RNDNE},
             };
-            for (int oi = 0; oi < 8; oi++) {
+            for (int oi = 0; oi < (int)(sizeof ou / sizeof ou[0]); oi++) {
                 if (strncmp(rest, ou[oi].n, ou[oi].len) == 0
                     && rest[ou[oi].len] == '_') {
                     uint32_t an = ND(L, callee_n)->next_sibling;
@@ -1928,7 +1937,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             static const struct { const char *n; size_t len; uint16_t op; } ob[] = {
                 {"fmax", 4, BIR_FMAX}, {"fmin", 4, BIR_FMIN},
             };
-            for (int oi = 0; oi < 2; oi++) {
+            for (int oi = 0; oi < (int)(sizeof ob / sizeof ob[0]); oi++) {
                 if (strncmp(rest, ob[oi].n, ob[oi].len) == 0
                     && rest[ob[oi].len] == '_') {
                     uint32_t an = ND(L, callee_n)->next_sibling;
@@ -1978,12 +1987,19 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
         uint32_t ret_t = L->M->types[ftype].inner;
 
         /* Lower arguments */
-        uint32_t args[16];
+        uint32_t args[BC_MAX_ARGS];
         int nargs = 0;
         uint32_t arg = ND(L, callee_n)->next_sibling;
-        while (arg && nargs < 16) {
+        while (arg && nargs < BC_MAX_ARGS) {
             args[nargs++] = lower_expr(L, arg);
             arg = ND(L, arg)->next_sibling;
+        }
+        /* Sema rejects this first, so reaching it means the two caps have
+         * drifted apart. Dropping the tail would emit a call with the wrong
+         * operands and no sign anything was lost. */
+        if (arg) {
+            lower_error(L, node, BC_E082, "call", BC_MAX_ARGS);
+            return BIR_VAL_NONE;
         }
 
         if (1 + nargs <= BIR_OPERANDS_INLINE) {
@@ -1996,11 +2012,14 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
         /* Overflow mode: pack into extra_operands */
         {
             uint32_t extra_start = L->M->num_extra_ops;
-            if (L->M->num_extra_ops < BIR_MAX_EXTRA_OPS)
-                L->M->extra_operands[L->M->num_extra_ops++] = fi;
+            /* All of it or none: packing what fits drops arguments. */
+            if (L->M->num_extra_ops + 1u + (uint32_t)nargs > BIR_MAX_EXTRA_OPS) {
+                bir_pfull(L->M, BIR_P_EXTRAOPS);
+                return BIR_VAL_NONE;
+            }
+            L->M->extra_operands[L->M->num_extra_ops++] = fi;
             for (int i = 0; i < nargs; i++)
-                if (L->M->num_extra_ops < BIR_MAX_EXTRA_OPS)
-                    L->M->extra_operands[L->M->num_extra_ops++] = args[i];
+                L->M->extra_operands[L->M->num_extra_ops++] = args[i];
             uint32_t total = L->M->num_extra_ops - extra_start;
             uint32_t inst = emit(L, BIR_CALL, ret_t, BIR_OPERANDS_OVERFLOW, 0);
             set_op(L, inst, 0, extra_start);
@@ -2751,6 +2770,11 @@ static void lower_stmt(lower_t *L, uint32_t node)
         /* Emit BIR_SWITCH in overflow mode */
         {
             uint32_t extra_start = L->M->num_extra_ops;
+            /* Worst case is cond, default, then a pair per case. Flag up
+               front; the pack below still truncates, but nothing reads it. */
+            if (L->M->num_extra_ops + 2u + 2u * (uint32_t)ncases
+                > BIR_MAX_EXTRA_OPS)
+                bir_pfull(L->M, BIR_P_EXTRAOPS);
             /* Pack: cond_val, default_block, (case_const, target_block)... */
             if (L->M->num_extra_ops < BIR_MAX_EXTRA_OPS)
                 L->M->extra_operands[L->M->num_extra_ops++] = cond_v;
@@ -2946,8 +2970,11 @@ static void lower_func_body(lower_t *L, uint32_t func_def,
     /* Create function type */
     uint32_t fn_type = bir_type_func(L->M, ret_t, param_types, nparams);
 
-    /* Create function */
-    if (L->M->num_funcs >= BIR_MAX_FUNCS) return;
+    /* Create function. Bailing leaves cur_func on the previous one. */
+    if (L->M->num_funcs >= BIR_MAX_FUNCS) {
+        bir_pfull(L->M, BIR_P_FUNCS);
+        return;
+    }
     uint32_t fi = L->M->num_funcs++;
     L->cur_func = fi;
 
@@ -3181,7 +3208,10 @@ static void collect_global_var(lower_t *L, uint32_t node)
 {
     uint16_t cuda = ND(L, node)->cuda_flags;
     if (!(cuda & (CUDA_SHARED | CUDA_CONSTANT | CUDA_DEVICE))) return;
-    if (L->M->num_globals >= BIR_MAX_GLOBALS) return;
+    if (L->M->num_globals >= BIR_MAX_GLOBALS) {
+        bir_pfull(L->M, BIR_P_GLOBALS);
+        return;
+    }
 
     uint32_t type_n = child_at(L, node, 0);
     uint32_t name_n = child_at(L, node, 1);
