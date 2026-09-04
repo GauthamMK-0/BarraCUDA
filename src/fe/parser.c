@@ -28,6 +28,9 @@ static const char *ast_names[] = {
     [AST_INIT_LIST]     = "init_list",
     [AST_SCOPE_RES]     = "scope",
     [AST_TEMPLATE_ARGS] = "template_args",
+    [AST_PACK_EXP]      = "pack_exp",
+    [AST_PACK_SIZE]     = "pack_size",
+    [AST_FOLD]          = "fold",
     [AST_EXPR_STMT]     = "expr_stmt",
     [AST_BLOCK]         = "block",
     [AST_IF]            = "if",
@@ -133,6 +136,22 @@ static void parse_error(parser_t *P, bc_eid_t eid, ...)
     }
 }
 
+static void nderr(parser_t *P, uint32_t node, bc_eid_t eid, ...)
+{
+    if (P->num_errors < BC_MAX_ERRORS) {
+        bc_error_t *e = &P->errors[P->num_errors++];
+        e->loc.line = P->nodes[node].line;
+        e->loc.col = P->nodes[node].col;
+        e->loc.offset = 0;
+        e->code = BC_ERR_PARSE;
+        e->eid  = (uint16_t)eid;
+        va_list ap;
+        va_start(ap, eid);
+        vsnprintf(e->msg, sizeof(e->msg), bc_efmt(eid), ap);
+        va_end(ap);
+    }
+}
+
 static int match(parser_t *P, int type)
 {
     if (cur_type(P) == type) { advance(P); return 1; }
@@ -197,6 +216,30 @@ static const char *tntxt(const parser_t *P, uint32_t off)
                                : P->src + off;
 }
 
+/* Names sema resolves as types with no typedef anywhere in the source: the
+ * stdint spellings, the half formats, and the CUDA vector types. The parser
+ * has to recognise them too, or (uint32_t)-1 reads as a subtraction. Keep in
+ * step with resolve_typespec in sema.c. */
+static const char *const btnams[] = {
+    "size_t", "ptrdiff_t",
+    "int8_t", "uint8_t", "int16_t", "uint16_t",
+    "int32_t", "uint32_t", "int64_t", "uint64_t",
+    "half", "__half", "_Float16",
+    "nv_bfloat16", "__nv_bfloat16", "__bfloat16", "__hip_bfloat16",
+    "float2", "float3", "float4",
+    "double2", "double3", "double4",
+    "int2", "int3", "int4",
+    "uint2", "uint3", "uint4",
+    "char2", "char3", "char4",
+    "uchar2", "uchar3", "uchar4",
+    "short2", "short3", "short4",
+    "ushort2", "ushort3", "ushort4",
+    "long2", "long3", "long4",
+    "ulong2", "ulong3", "ulong4",
+    "longlong2", "ulonglong2",
+    "dim3"
+};
+
 static int is_reg_type(const parser_t *P, uint32_t off, uint16_t len)
 {
     const char *q = tntxt(P, off);
@@ -205,7 +248,94 @@ static int is_reg_type(const parser_t *P, uint32_t off, uint16_t len)
             memcmp(tntxt(P, P->tnames[i].off), q, len) == 0)
             return 1;
     }
+    for (size_t i = 0; i < sizeof btnams / sizeof btnams[0]; i++) {
+        if (strlen(btnams[i]) == (size_t)len &&
+            memcmp(btnams[i], q, len) == 0)
+            return 1;
+    }
     return 0;
+}
+
+/* ---- Parameter pack registry ---- */
+
+static void pk_add(parser_t *P, uint32_t off, uint32_t len)
+{
+    if (P->npacks >= 32 || len == 0) return;
+    P->packs[P->npacks].off = off;
+    P->packs[P->npacks].len = len;
+    P->npacks++;
+}
+
+static int pk_is(const parser_t *P, uint32_t off, uint32_t len)
+{
+    const char *q = tntxt(P, off);
+    for (int i = 0; i < P->npacks; i++) {
+        if (P->packs[i].len == len &&
+            memcmp(tntxt(P, P->packs[i].off), q, (size_t)len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int pk_tsp(const parser_t *P, uint32_t tsp)
+{
+    if (!tsp || P->nodes[tsp].type != AST_TYPE_SPEC) return 0;
+    if (P->nodes[tsp].d.btype.kind != TYPE_NAME) return 0;
+    uint32_t nm = P->nodes[tsp].first_child;
+    if (!nm || P->nodes[nm].type != AST_IDENT) return 0;
+    return pk_is(P, P->nodes[nm].d.text.offset, P->nodes[nm].d.text.len);
+}
+
+static int pk_sub(const parser_t *P, uint32_t node, int depth)
+{
+    if (!node || depth > 64) return 0;
+    const ast_node_t *n = &P->nodes[node];
+    if (n->type == AST_IDENT &&
+        pk_is(P, n->d.text.offset, n->d.text.len)) return 1;
+    for (uint32_t c = n->first_child; c; c = P->nodes[c].next_sibling)
+        if (pk_sub(P, c, depth + 1)) return 1;
+    return 0;
+}
+
+static void pk_chk(parser_t *P, uint32_t node, int in_exp, int depth)
+{
+    if (!node || depth > 64) return;
+    ast_node_t *n = &P->nodes[node];
+    int t = n->type;
+
+    if (t == AST_TEMPLATE_PARAM) return;
+    if (t == AST_PARAM && n->d.oper.op == PRM_PACK) return;
+    if (t == AST_PACK_EXP || t == AST_PACK_SIZE || t == AST_FOLD) in_exp = 1;
+
+    if (t == AST_IDENT && !in_exp &&
+        pk_is(P, n->d.text.offset, n->d.text.len)) {
+        char nm[64];
+        uint32_t len = n->d.text.len < 63 ? n->d.text.len : 63;
+        memcpy(nm, tntxt(P, n->d.text.offset), (size_t)len);
+        nm[len] = 0;
+        nderr(P, node, BC_E083, nm);
+        return;
+    }
+
+    for (uint32_t c = n->first_child; c; c = P->nodes[c].next_sibling)
+        pk_chk(P, c, in_exp, depth + 1);
+}
+
+static int is_fop(int t)
+{
+    switch (t) {
+    case TOK_PLUS: case TOK_MINUS: case TOK_STAR: case TOK_SLASH:
+    case TOK_PERCENT: case TOK_CARET: case TOK_AMP: case TOK_PIPE:
+    case TOK_SHL: case TOK_SHR:
+    case TOK_PLUS_EQ: case TOK_MINUS_EQ: case TOK_STAR_EQ:
+    case TOK_SLASH_EQ: case TOK_PERCENT_EQ: case TOK_CARET_EQ:
+    case TOK_AMP_EQ: case TOK_PIPE_EQ: case TOK_SHL_EQ: case TOK_SHR_EQ:
+    case TOK_ASSIGN: case TOK_EQ: case TOK_NE: case TOK_LT: case TOK_GT:
+    case TOK_LE: case TOK_GE: case TOK_LAND: case TOK_LOR: case TOK_COMMA:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 static int is_type_keyword(int type)
@@ -241,6 +371,9 @@ static int is_storage_class(int type)
     switch (type) {
     case TOK_STATIC: case TOK_EXTERN: case TOK_REGISTER:
     case TOK_INLINE: case TOK_TYPEDEF:
+    /* _Noreturn carries no flag. Nothing in BIR or any backend asks whether
+       a callee returns, so accepting and dropping it is the whole semantics. */
+    case TOK_NORETURN:
         return 1;
     default:
         return 0;
@@ -415,27 +548,113 @@ static int looks_like_cast(parser_t *P)
     if (t == TOK_IDENT) {
         const token_t *id = &P->tokens[P->pos + 1 < P->num_tokens
                                         ? P->pos + 1 : P->num_tokens - 1];
-        int known = is_reg_type(P, id->offset, (uint16_t)id->len);
-        if (peek_type(P, 2) == TOK_RPAREN) {
-            int after = peek_type(P, 3);
-            /* (ident) *expr — the classic C ambiguity. Could be
-             * cast+deref OR multiplication. Only treat as cast if
-             * we KNOW it's a type. Cost of getting this wrong: one
-             * GPU aperture fault and an afternoon of disassembly. */
-            if (after == TOK_STAR || after == TOK_AMP) {
-                if (known) return 1;
-            } else if (can_start_unary(after)) {
-                /* (ident)0, (ident)x etc. — no mul/deref ambiguity,
-                 * safe to assume cast (covers template params too) */
-                return 1;
-            }
-        }
         /* (ident*) or (ident**) — pointer cast to struct/vector type.
-         * Star is INSIDE the parens (part of the type), not ambiguous. */
+         * Star is INSIDE the parens (part of the type), not ambiguous, and
+         * a mismatch backtracks below, so a header typedef still casts. */
         if (peek_type(P, 2) == TOK_STAR)
             return 1;
+        /* (ident) anything — the classic C ambiguity. Every prefix operator
+         * that is also infix reaches here, so the only sound test is whether
+         * the name is a type in scope. Guess it and (a) + (b) quietly becomes
+         * b. Cost of getting this wrong: one GPU aperture fault and an
+         * afternoon of disassembly. */
+        if (peek_type(P, 2) == TOK_RPAREN &&
+            is_reg_type(P, id->offset, (uint16_t)id->len)) {
+            int after = peek_type(P, 3);
+            if (can_start_unary(after) || after == TOK_LBRACE)
+                return 1;
+        }
     }
     return 0;
+}
+
+static uint32_t pexp(parser_t *P, uint32_t arg)
+{
+    if (cur_type(P) != TOK_ELLIPSIS) return arg;
+    advance(P);
+    if (cur_type(P) == TOK_LBRACKET) {
+        parse_error(P, BC_E030, "pack indexing");
+        return arg;
+    }
+    if (!pk_sub(P, arg, 0)) parse_error(P, BC_E031);
+    uint32_t n = alloc_node(P, AST_PACK_EXP);
+    if (!n) return arg;
+    add_child(P, n, arg);
+    return n;
+}
+
+static int foldp(const parser_t *P)
+{
+    int depth = 0;
+    for (uint32_t i = P->pos; i < P->num_tokens; i++) {
+        int t = P->tokens[i].type;
+        if (t == TOK_LPAREN || t == TOK_LBRACKET || t == TOK_LBRACE) depth++;
+        else if (t == TOK_RPAREN || t == TOK_RBRACKET || t == TOK_RBRACE) {
+            if (--depth <= 0) return 0;
+        }
+        else if (t == TOK_ELLIPSIS && depth == 1) return 1;
+        else if (t == TOK_SEMI || t == TOK_EOF) return 0;
+    }
+    return 0;
+}
+
+static uint32_t pfold(parser_t *P)
+{
+    uint32_t n = alloc_node(P, AST_FOLD);
+    char got[64];
+
+    advance(P);
+    if (cur_type(P) == TOK_ELLIPSIS) {
+        advance(P);
+        int op = cur_type(P);
+        if (!is_fop(op)) {
+            parse_error(P, BC_E020, "fold operator",
+                        cur_text(P, got, sizeof got));
+            return n;
+        }
+        advance(P);
+        uint32_t e = parse_expr(P, 150);
+        add_child(P, n, e);
+        P->nodes[n].d.oper.op = op;
+        if (cur_type(P) == TOK_RPAREN) {
+            P->nodes[n].d.oper.flags = FLD_UL;
+            if (!pk_sub(P, e, 0)) parse_error(P, BC_E031);
+            advance(P);
+            return n;
+        }
+        parse_error(P, BC_E020, ")", cur_text(P, got, sizeof got));
+        return n;
+    }
+
+    uint32_t e1 = parse_expr(P, 150);
+    add_child(P, n, e1);
+    int op = cur_type(P);
+    if (!is_fop(op)) {
+        parse_error(P, BC_E020, "fold operator", cur_text(P, got, sizeof got));
+        return n;
+    }
+    P->nodes[n].d.oper.op = op;
+    advance(P);
+    expect(P, TOK_ELLIPSIS);
+    if (cur_type(P) == TOK_RPAREN) {
+        P->nodes[n].d.oper.flags = FLD_UR;
+        if (!pk_sub(P, e1, 0)) parse_error(P, BC_E031);
+        advance(P);
+        return n;
+    }
+    if (cur_type(P) != op) {
+        parse_error(P, BC_E020, token_type_name(op),
+                    cur_text(P, got, sizeof got));
+        return n;
+    }
+    advance(P);
+    uint32_t e2 = parse_expr(P, 150);
+    add_child(P, n, e2);
+    int p1 = pk_sub(P, e1, 0), p2 = pk_sub(P, e2, 0);
+    if (p1 == p2) parse_error(P, BC_E031);
+    P->nodes[n].d.oper.flags = p1 ? FLD_BR : FLD_BL;
+    expect(P, TOK_RPAREN);
+    return n;
 }
 
 static uint32_t parse_primary(parser_t *P)
@@ -507,7 +726,7 @@ static uint32_t parse_primary(parser_t *P)
             uint32_t ilist = alloc_node(P, AST_INIT_LIST);
             advance(P);
             while (cur_type(P) != TOK_RBRACE && cur_type(P) != TOK_EOF) {
-                uint32_t elem = parse_expr(P, 21);
+                uint32_t elem = pexp(P, parse_expr(P, 21));
                 add_child(P, ilist, elem);
                 if (!match(P, TOK_COMMA)) break;
             }
@@ -520,11 +739,35 @@ static uint32_t parse_primary(parser_t *P)
         }
         return n;
     }
+    if (t == TOK_SIZEOF && peek_type(P, 1) == TOK_ELLIPSIS) {
+        uint32_t n = alloc_node(P, AST_PACK_SIZE);
+        advance(P);
+        advance(P);
+        expect(P, TOK_LPAREN);
+        if (cur_type(P) == TOK_IDENT) {
+            uint32_t id = alloc_node(P, AST_IDENT);
+            P->nodes[id].d.text.offset = cur(P)->offset;
+            P->nodes[id].d.text.len = cur(P)->len;
+            if (!pk_is(P, cur(P)->offset, cur(P)->len)) {
+                char got[64];
+                parse_error(P, BC_E083, cur_text(P, got, sizeof got));
+            }
+            advance(P);
+            add_child(P, n, id);
+        } else {
+            parse_error(P, BC_E022);
+        }
+        expect(P, TOK_RPAREN);
+        return n;
+    }
     if (t == TOK_SIZEOF) {
         uint32_t n = alloc_node(P, AST_SIZEOF);
         advance(P);
         if (match(P, TOK_LPAREN)) {
-            if (is_type_keyword(cur_type(P))) {
+            if (is_type_keyword(cur_type(P)) ||
+                (cur_type(P) == TOK_IDENT &&
+                 peek_type(P, 1) == TOK_RPAREN &&
+                 is_reg_type(P, cur(P)->offset, (uint16_t)cur(P)->len))) {
                 uint16_t sq = 0, sc = 0;
                 uint32_t inner = parse_type_spec(P, &sq, &sc);
                 while (cur_type(P) == TOK_STAR) advance(P);
@@ -558,6 +801,8 @@ static uint32_t parse_primary(parser_t *P)
         expect(P, TOK_RPAREN);
         return cast;
     }
+    if (t == TOK_LPAREN && foldp(P))
+        return pfold(P);
     if (looks_like_cast(P)) {
         uint32_t saved = P->pos;
         advance(P);
@@ -588,7 +833,7 @@ static uint32_t parse_primary(parser_t *P)
         uint32_t n = alloc_node(P, AST_INIT_LIST);
         advance(P);
         while (cur_type(P) != TOK_RBRACE && cur_type(P) != TOK_EOF) {
-            uint32_t elem = parse_expr(P, 21);
+            uint32_t elem = pexp(P, parse_expr(P, 21));
             add_child(P, n, elem);
             if (!match(P, TOK_COMMA)) break;
         }
@@ -619,6 +864,10 @@ static uint32_t parse_expr(parser_t *P, int min_prec)
     for (;;) {
         int t = cur_type(P);
         if (t == TOK_EOF || t == TOK_SEMI || t == TOK_RBRACE) break;
+        if (t == TOK_ELLIPSIS && peek_type(P, 1) == TOK_LBRACKET) {
+            parse_error(P, BC_E030, "pack indexing");
+            break;
+        }
 
         int pbp = postfix_bp(t);
         if (pbp >= 0 && pbp >= min_prec) {
@@ -635,7 +884,7 @@ static uint32_t parse_expr(parser_t *P, int min_prec)
                 add_child(P, call, lhs);
                 advance(P);
                 while (cur_type(P) != TOK_RPAREN && cur_type(P) != TOK_EOF) {
-                    uint32_t arg = parse_expr(P, 21);
+                    uint32_t arg = pexp(P, parse_expr(P, 21));
                     add_child(P, call, arg);
                     if (!match(P, TOK_COMMA)) break;
                 }
@@ -687,7 +936,7 @@ static uint32_t parse_expr(parser_t *P, int min_prec)
                 expect(P, TOK_LAUNCH_CLOSE);
                 expect(P, TOK_LPAREN);
                 while (cur_type(P) != TOK_RPAREN && cur_type(P) != TOK_EOF) {
-                    uint32_t arg = parse_expr(P, 21);
+                    uint32_t arg = pexp(P, parse_expr(P, 21));
                     add_child(P, launch, arg);
                     if (!match(P, TOK_COMMA)) break;
                 }
@@ -728,6 +977,27 @@ static uint32_t parse_expr(parser_t *P, int min_prec)
 
 /* Where we divine the programmer's intent from a soup of keywords */
 
+/* [[noreturn]], [[maybe_unused]] and the rest. Booth models none of them and
+   they are all hints, so the run is consumed whole. Returns 1 if it ate one. */
+static int skatt(parser_t *P)
+{
+    int got = 0;
+    KA_GUARD(g, 64);
+    while (g-- && cur_type(P) == TOK_LBRACKET && peek_type(P, 1) == TOK_LBRACKET) {
+        int depth = 0;
+        KA_GUARD(h, 4096);
+        while (h-- && cur_type(P) != TOK_EOF) {
+            int t = cur_type(P);
+            if (t == TOK_LBRACKET) depth++;
+            else if (t == TOK_RBRACKET) depth--;
+            advance(P);
+            if (depth == 0) break;
+        }
+        got = 1;
+    }
+    return got;
+}
+
 static uint32_t parse_type_spec(parser_t *P, uint16_t *quals, uint16_t *cuda)
 {
     *quals = 0;
@@ -735,7 +1005,9 @@ static uint32_t parse_type_spec(parser_t *P, uint16_t *quals, uint16_t *cuda)
 
     for (;;) {
         int ct = cur_type(P);
-        if (is_cuda_qualifier(ct)) {
+        if (ct == TOK_LBRACKET && peek_type(P, 1) == TOK_LBRACKET) {
+            if (!skatt(P)) break;
+        } else if (is_cuda_qualifier(ct)) {
             *cuda |= cuda_flag_for(ct);
             advance(P);
             /* __launch_bounds__(maxThreads[, minBlocks]) — actually read the numbers
@@ -873,6 +1145,7 @@ static uint32_t parse_param_list(parser_t *P)
         if (cur_type(P) == TOK_ELLIPSIS) {
             uint32_t va = alloc_node(P, AST_PARAM);
             P->nodes[va].d.oper.flags = 1;
+            P->nodes[va].d.oper.op = PRM_VARG;
             advance(P);
             if (!first) first = va; else P->nodes[last].next_sibling = va;
             last = va;
@@ -889,11 +1162,30 @@ static uint32_t parse_param_list(parser_t *P)
         {
             int ptr_depth = 0;
             while (cur_type(P) == TOK_STAR || cur_type(P) == TOK_AMP ||
-                   cur_type(P) == TOK_CONST || cur_type(P) == TOK_CU_RESTRICT) {
+                   cur_type(P) == TOK_LAND || cur_type(P) == TOK_CONST ||
+                   cur_type(P) == TOK_CU_RESTRICT) {
                 if (cur_type(P) == TOK_STAR) ptr_depth++;
                 advance(P);
             }
             P->nodes[param].d.oper.flags = ptr_depth;
+        }
+
+        if (cur_type(P) == TOK_ELLIPSIS) {
+            if (pk_tsp(P, type)) {
+                advance(P);
+                P->nodes[param].d.oper.op = PRM_PACK;
+                if (cur_type(P) == TOK_LBRACKET)
+                    parse_error(P, BC_E030, "pack indexing");
+            } else {
+                advance(P);
+                if (!first) first = param; else P->nodes[last].next_sibling = param;
+                last = param;
+                uint32_t va = alloc_node(P, AST_PARAM);
+                P->nodes[va].d.oper.flags = 1;
+                P->nodes[va].d.oper.op = PRM_VARG;
+                P->nodes[last].next_sibling = va;
+                break;
+            }
         }
 
         if (is_fnptr(P)) {
@@ -905,6 +1197,8 @@ static uint32_t parse_param_list(parser_t *P)
             uint32_t name = alloc_node(P, AST_IDENT);
             P->nodes[name].d.text.offset = cur(P)->offset;
             P->nodes[name].d.text.len = cur(P)->len;
+            if (P->nodes[param].d.oper.op == PRM_PACK)
+                pk_add(P, cur(P)->offset, cur(P)->len);
             advance(P);
             add_child(P, param, name);
         }
@@ -1007,27 +1301,40 @@ static uint32_t parse_declaration(parser_t *P)
 
     if (cur_type(P) == TOK_TEMPLATE) {
         uint32_t tmpl = alloc_node(P, AST_TEMPLATE_DECL);
+        int sv_npk = P->npacks;
+        int nparm = 0, lastpk = 0;
         advance(P);
         expect(P, TOK_LT);
         while (cur_type(P) != TOK_GT && cur_type(P) != TOK_EOF) {
             uint32_t tp = alloc_node(P, AST_TEMPLATE_PARAM);
+            int fl = 0;
             if (cur_type(P) == TOK_TYPENAME || cur_type(P) == TOK_CLASS) {
-                P->nodes[tp].d.oper.flags = 0;
                 advance(P);
             } else {
-                P->nodes[tp].d.oper.flags = 1;
+                fl = TP_NTYP;
                 uint16_t q2, c2;
                 uint32_t ptype = parse_type_spec(P, &q2, &c2);
                 add_child(P, tp, ptype);
             }
+            if (match(P, TOK_ELLIPSIS)) fl |= TP_PACK;
+            P->nodes[tp].d.oper.flags = fl;
+            nparm++;
+            if (fl & TP_PACK) lastpk = nparm;
             if (cur_type(P) == TOK_IDENT) {
                 uint32_t name = alloc_node(P, AST_IDENT);
                 P->nodes[name].d.text.offset = cur(P)->offset;
                 P->nodes[name].d.text.len = cur(P)->len;
+                if (fl & TP_PACK) pk_add(P, cur(P)->offset, cur(P)->len);
                 advance(P);
                 add_child(P, tp, name);
+                /* A type parameter is a type name for the body below it,
+                 * so (T)x still casts once the registry is the test. */
+                if (P->nodes[tp].d.oper.flags == 0)
+                    reg_tname(P, P->nodes[name].d.text.offset,
+                              (uint16_t)P->nodes[name].d.text.len);
             }
             if (cur_type(P) == TOK_ASSIGN) {
+                if (fl & TP_PACK) parse_error(P, BC_E029);
                 advance(P);
                 uint32_t def = parse_expr(P, 21);
                 add_child(P, tp, def);
@@ -1037,7 +1344,15 @@ static uint32_t parse_declaration(parser_t *P)
         }
         expect(P, TOK_GT);
         uint32_t inner = parse_declaration(P);
+        if (lastpk && lastpk != nparm && inner &&
+            (P->nodes[inner].type == AST_STRUCT_DEF ||
+             P->nodes[inner].type == AST_VAR_DECL))
+            parse_error(P, BC_E028);
+        if (lastpk && inner && P->nodes[inner].type == AST_USING)
+            nderr(P, inner, BC_E030, "variadic alias template");
         add_child(P, tmpl, inner);
+        if (P->npacks > sv_npk) pk_chk(P, inner, 0, 0);
+        P->npacks = sv_npk;
         return tmpl;
     }
 
@@ -1081,6 +1396,10 @@ static uint32_t parse_declaration(parser_t *P)
             add_child(P, u, name);
             match(P, TOK_DCOLON);
             if (cur_type(P) == TOK_ASSIGN) {
+                /* using X = T is a typedef wearing a nicer jacket, so X has
+                 * to reach the registry the same way. */
+                reg_tname(P, P->nodes[name].d.text.offset,
+                          (uint16_t)P->nodes[name].d.text.len);
                 advance(P);
                 uint16_t q2, c2;
                 uint32_t alias_type = parse_type_spec(P, &q2, &c2);
@@ -1325,11 +1644,8 @@ static uint32_t parse_declaration(parser_t *P)
             while (cur_type(P) != TOK_GT && cur_type(P) != TOK_EOF) {
                 uint16_t q2, c2;
                 uint32_t ta = parse_type_spec(P, &q2, &c2);
-                if (ta) add_child(P, targs, ta);
-                else {
-                    uint32_t ea = parse_expr(P, 21);
-                    add_child(P, targs, ea);
-                }
+                if (!ta) ta = parse_expr(P, 21);
+                add_child(P, targs, pexp(P, ta));
                 if (!match(P, TOK_COMMA)) break;
             }
             expect(P, TOK_GT);
@@ -1655,6 +1971,8 @@ static uint32_t parse_stmt(parser_t *P)
 
 static uint32_t parse_decl_or_stmt(parser_t *P)
 {
+    skatt(P);
+
     if (cur_type(P) == TOK_PP_LINE) {
         uint32_t pp = alloc_node(P, AST_PP_DIRECTIVE);
         P->nodes[pp].d.text.offset = cur(P)->offset;

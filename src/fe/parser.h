@@ -4,7 +4,7 @@
 #include "ast.h"
 #include "token.h"
 
-typedef struct {
+typedef struct parser_s {
     const token_t  *tokens;
     uint32_t        num_tokens;
     uint32_t        pos;
@@ -31,6 +31,9 @@ typedef struct {
     char            anon_buf[256];
     uint32_t        anon_len;
     uint32_t        anon_cnt;
+
+    struct { uint32_t off; uint32_t len; } packs[32];
+    int             npacks;
 
     /* Enclosing struct name, so a constructor can be told apart from a
      * declaration that happens to start with a type name. len 0 = not in one. */

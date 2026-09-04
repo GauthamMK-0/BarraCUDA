@@ -15,8 +15,8 @@
  * everything downstream derives from these three numbers. */
 #define BC_VERSION_MAJOR    0
 #define BC_VERSION_MINOR    5
-#define BC_VERSION_PATCH    2
-#define BC_VERSION_STRING   "0.5.2"
+#define BC_VERSION_PATCH    3
+#define BC_VERSION_STRING   "0.5.3"
 
 /* The universe has limits. So do our buffers. No malloc, no madness. */
 #define BC_MAX_SOURCE       (4 * 1024 * 1024)
@@ -26,6 +26,7 @@
 /* Arguments in one call. Real ocean kernels pass 23, so 16 was not enough. */
 #define BC_MAX_ARGS         64
 #define BC_MAX_PATH         512
+#define BC_MAX_TUS          256
 #define BC_MAX_DEPTH        256
 #define CUDA_GLOBAL         0x0001
 #define CUDA_DEVICE         0x0002
@@ -45,6 +46,16 @@
 #define BC_ERR_PARSE       -3
 #define BC_ERR_OVERFLOW    -4
 #define BC_ERR_VERIFY      -5
+#define BC_ERR_AMDGPU      -6
+#define BC_ERR_TENSIX      -7
+#define BC_ERR_METAL       -8
+#define BC_ERR_INTEL       -9
+#define BC_ERR_TRITON      -10
+#define BC_ERR_TDF         -11
+#define BC_ERR_PREPROC     -12
+#define BC_ERR_LOWER       -13
+#define BC_ERR_SEMA        -14
+#define BC_ERR_NVIDIA      -15
 
 typedef struct {
     uint32_t line;

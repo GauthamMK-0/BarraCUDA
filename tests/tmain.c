@@ -2,6 +2,8 @@
  * Runs tests in a sensible order, prints dots, judges silently. */
 
 #include "tharns.h"
+#include "booth/bc_abend.h"
+#include "bc_err.h"
 
 /* ---- Storage ---- */
 
@@ -80,6 +82,7 @@ static const tfam_t fam_order[] = {
     { "err", "terrs.c",     "diagnostics",              2 },
     { "typ", "ttypes.c",    "type table",               2 },
     { "tab", "ttabs.c",     "static tables",            2 },
+    { "pck", "tpack.c",     "parameter packs",          2 },
 
     { "dce", "tdce.c",      "dead code elimination",    2 },
     { "cfd", "tcfold.c",    "constant folding",         2 },
@@ -103,7 +106,9 @@ static const tfam_t fam_order[] = {
     { "tdf", "ttdf.c",      "Tensix dataflow",          2 },
 
     { "tri", "ttriton.c",   "Triton frontend",          2 },
+    { "mma", "tmma.c",      "warp matrix multiply",     2 },
     { "mlr", "tmlir.c",     "MLIR reader",              2 },
+    { "bir", "tbir.c",      "BIR text frontend",        2 },
 
     { "sfp", "tsoft_fp.c",  "soft float",               2 },
     { "spr", "tsysprint.c", "SYSPRINT",                 2 },
@@ -114,6 +119,8 @@ static const tfam_t fam_order[] = {
     { "wsz", "twarpsize.c", "warp size",                2 },
 
     { "ord", "tordr.c",     "harness ordering",         2 },
+    { "ocm", "tocm.c",      "OCaml frontend",           2 },
+    { "mtu", "tmtu.c",      "multiple translation units", 2 },
     { "rpi", "trpi.c",      "shipped-bug regressions",  2 },
 };
 
@@ -267,6 +274,8 @@ static void usage(void)
 
 int main(int argc, char *argv[])
 {
+    ab_set_msg_lookup(ab_afmt);
+
     const char *filter_fam  = NULL;
     const char *filter_test = NULL;
     int list_mode = 0;

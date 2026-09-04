@@ -14,7 +14,6 @@
  * decorators other than @triton.jit, and almost none of the standard
  * library. */
 
-#define BC_ERR_TRITON   -10
 
 /* ---- Limits ----
  * Fixed pools, no malloc on the hot path. Sized like the C99
@@ -491,6 +490,9 @@ typedef struct {
      * produced. Resolves Name references back to the value their
      * declaring node generated. */
     uint32_t        node_val[TN_MAX_NODES];
+
+    int             loopd;
+    uint8_t         vald[TN_MAX_NODES];
 
     /* Rank-2 (and rank-1) tiles in a kernel that uses tl.dot are
      * materialised and fully unrolled: each tile is an array of

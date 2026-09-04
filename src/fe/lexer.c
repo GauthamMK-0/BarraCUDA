@@ -10,6 +10,7 @@ typedef struct {
 } kw_entry_t;
 
 static const kw_entry_t keywords[] = {
+    {"_Noreturn",          TOK_NORETURN},
     {"__constant__",       TOK_CU_CONSTANT},
     {"__device__",         TOK_CU_DEVICE},
     {"__forceinline__",    TOK_CU_FORCEINLINE},
@@ -262,6 +263,7 @@ static const char *tok_names[] = {
     [TOK_CU_RESTRICT]   = "__restrict__",
     [TOK_CU_FORCEINLINE] = "__forceinline__",
     [TOK_CU_NOINLINE]   = "__noinline__",
+    [TOK_NORETURN]      = "_Noreturn",
     [TOK_EOF]           = "EOF",
     [TOK_ERROR]         = "ERROR",
 };
@@ -362,6 +364,14 @@ int lexer_token_text(const lexer_t *L, const token_t *tok,
     memcpy(buf, L->src + tok->offset, (size_t)len);
     buf[len] = '\0';
     return len;
+}
+
+static uint32_t lx_splc(const lexer_t *L)
+{
+    if (cur(L) != '\\') return 0;
+    if (peek(L, 1) == '\n') return 2;
+    if (peek(L, 1) == '\r' && peek(L, 2) == '\n') return 3;
+    return 0;
 }
 
 static void skip_whitespace(lexer_t *L)
@@ -512,12 +522,10 @@ static void scan_pp_line(lexer_t *L)
     uint16_t start_col = (uint16_t)(L->pos - L->line_start + 1);
 
     while (!at_end(L) && cur(L) != '\n') {
-        if (cur(L) == '\\' && peek(L, 1) == '\n') {
-            advance(L); /* skip backslash */
-            advance(L); /* skip newline (line continuation) */
-        } else {
+        uint32_t n = lx_splc(L);
+        if (n == 0) n = 1;
+        for (uint32_t i = 0; i < n; i++)
             advance(L);
-        }
     }
 
     emit(L, TOK_PP_LINE, start, L->pos - start, start_line, start_col);

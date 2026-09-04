@@ -36,6 +36,7 @@ E049=#include: nesting too deep (max %d)
 E050=#include: cannot read '%s'
 E051=unknown directive: #%s
 E052=unterminated #if/#ifdef (missing %d #endif)
+E053=preprocessor output overflow (max %d bytes)
 
 # ---- Sema (E070-E099) ----
 E070=arrow on non-pointer
@@ -81,6 +82,10 @@ E122=expected parameter name
 E123=expected identifier after 'import'
 E124=expected attribute name after '.'
 E125=unrecognised expression
+
+# ---- Linking translation units (E126-E127) ----
+E126='%s' is defined in more than one translation unit
+E127=too many globals to reference (max %d)
 
 # ---- ABEND Messages (hex IDs) ----
 A0C1=illegal GPU instruction

@@ -35,6 +35,48 @@ static void st_slot(cpu_mod_t *X,int r,int32_t o){ rexw(X,r,X_RBP);eb(X,0x89);mo
 static void mov_imm(cpu_mod_t *X,int r,int64_t v){ rexw(X,0,r);eb(X,0xC7);modrm(X,3,0,r);ei32(X,(int32_t)v); }
 static int32_t slot(cpu_mod_t *X,uint32_t i){ return X->slots[i]; }
 
+/* ---- 32-bit operand forms ---- */
+
+/* No REX, so every write clears the upper half for free. RAX/RCX only. */
+static void e32_movrr(cpu_mod_t *X,int d,int s){ eb(X,0x89);modrm(X,3,s,d); }
+static void e32_movi(cpu_mod_t *X,int r,uint32_t v){ eb(X,(uint8_t)(0xB8+r));ei32(X,(int32_t)v); }
+static void e32_shr(cpu_mod_t *X,int r,int n){ eb(X,0xC1);modrm(X,3,5,r);eb(X,(uint8_t)n); }
+static void e32_shl(cpu_mod_t *X,int r,int n){ eb(X,0xC1);modrm(X,3,4,r);eb(X,(uint8_t)n); }
+static void e32_andi(cpu_mod_t *X,int r,uint32_t v){ eb(X,0x81);modrm(X,3,4,r);ei32(X,(int32_t)v); }
+static void e32_add(cpu_mod_t *X,int d,int s){ eb(X,0x01);modrm(X,3,s,d); }
+static void e32_sub(cpu_mod_t *X,int d,int s){ eb(X,0x29);modrm(X,3,s,d); }
+static void e32_or(cpu_mod_t *X,int d,int s){ eb(X,0x09);modrm(X,3,s,d); }
+static void e32_imuli(cpu_mod_t *X,int d,int s,uint32_t v){ eb(X,0x69);modrm(X,3,d,s);ei32(X,(int32_t)v); }
+static void e32_bsf(cpu_mod_t *X,int d,int s){ eb(X,0x0F);eb(X,0xBC);modrm(X,3,d,s); }
+static void e32_bsr(cpu_mod_t *X,int d,int s){ eb(X,0x0F);eb(X,0xBD);modrm(X,3,d,s); }
+static void e32_cmovz(cpu_mod_t *X,int d,int s){ eb(X,0x0F);eb(X,0x44);modrm(X,3,d,s); }
+static void e32_bswap(cpu_mod_t *X,int r){ eb(X,0x0F);eb(X,(uint8_t)(0xC8+r)); }
+
+/* SWAR rather than popcnt, which is SSE4.2 and would SIGILL on old kit.
+ * Operand arrives in EAX, answer leaves in EAX. */
+static void x86_popcount(cpu_mod_t *X)
+{
+    e32_movrr(X,X_RCX,X_RAX); e32_shr(X,X_RCX,1);
+    e32_andi(X,X_RCX,0x55555555u); e32_sub(X,X_RAX,X_RCX);
+    e32_movrr(X,X_RCX,X_RAX); e32_andi(X,X_RAX,0x33333333u);
+    e32_shr(X,X_RCX,2); e32_andi(X,X_RCX,0x33333333u);
+    e32_add(X,X_RAX,X_RCX);
+    e32_movrr(X,X_RCX,X_RAX); e32_shr(X,X_RCX,4); e32_add(X,X_RAX,X_RCX);
+    e32_andi(X,X_RAX,0x0F0F0F0Fu);
+    e32_imuli(X,X_RAX,X_RAX,0x01010101u); e32_shr(X,X_RAX,24);
+}
+
+static void x86_brev(cpu_mod_t *X)
+{
+    static const uint32_t m[3] = { 0x55555555u, 0x33333333u, 0x0F0F0F0Fu };
+    for (int i = 0; i < 3; i++) {
+        int n = 1 << i;
+        e32_movrr(X,X_RCX,X_RAX); e32_shr(X,X_RCX,n); e32_andi(X,X_RCX,m[i]);
+        e32_andi(X,X_RAX,m[i]); e32_shl(X,X_RAX,n); e32_or(X,X_RAX,X_RCX);
+    }
+    e32_bswap(X,X_RAX);
+}
+
 /* Width of an integer result, in the only two sizes that matter to the
  * shifters and the divider: 64 for an i64, 32 for everything narrower.
  * Pointers and the rest fall through to 64, which is what they are. The
@@ -63,42 +105,12 @@ static void load_val(cpu_mod_t *X,int reg,uint32_t v){
     else ld_slot(X,reg,slot(X,BIR_VAL_INDEX(v)));
 }
 
-/* element size in bytes of a pointer's pointee, default 4 (i32/f32).
- * Drives GEP stride, so it must be width-accurate: i8->1, i16->2,
- * i32/f32->4, i64/f64->8, ptr-to-ptr->8. */
-static int type_size(const cpu_mod_t *X,uint32_t ty);
-
-static int pointee_sz(cpu_mod_t *X,uint32_t ty){
-    if (ty<X->M->num_types && X->M->types[ty].kind==BIR_TYPE_PTR){
-        uint32_t in=X->M->types[ty].inner;
-        if (in<X->M->num_types){
-            uint8_t k=X->M->types[in].kind;
-            if (k==BIR_TYPE_PTR) return 8;
-            /* an array of structs strides by the whole struct, not by 4: a
-             * struct pointee has no width field, so size it properly or every
-             * index past the first lands in the wrong element. */
-            if (k==BIR_TYPE_STRUCT || k==BIR_TYPE_ARRAY || k==BIR_TYPE_VECTOR) return type_size(X,in);
-            uint32_t w=X->M->types[in].width;
-            if (w>=8) return (int)(w/8);
-        }
-    }
-    return 4;
+static int type_size(const cpu_mod_t *X,uint32_t ty){
+    return (int)bir_bsz(X->M,ty,8);
 }
 
-/* size in bytes of a type. Aggregate layout is naive (no padding),
- * which is fine here: the only aggregates we size are tiles, and a tile
- * is a run of one uniform scalar, so the plain sum lands exactly right. */
-static int type_size(const cpu_mod_t *X,uint32_t ty){
-    if (ty>=X->M->num_types) return 8;
-    const bir_type_t *t=&X->M->types[ty];
-    switch (t->kind){
-    case BIR_TYPE_INT: case BIR_TYPE_FLOAT: case BIR_TYPE_BFLOAT: return t->width?(int)(t->width/8):4;
-    case BIR_TYPE_PTR: return 8;
-    case BIR_TYPE_ARRAY: return (int)t->count*type_size(X,t->inner);
-    case BIR_TYPE_VECTOR: return (int)t->width*type_size(X,t->inner);
-    case BIR_TYPE_STRUCT: { int s=0; for(uint16_t i=0;i<t->num_fields;i++) s+=type_size(X,X->M->type_fields[t->count+i]); return s; }
-    default: return 8;
-    }
+static int pointee_sz(cpu_mod_t *X,uint32_t ty){
+    return (int)bir_gsz(X->M,ty,8);
 }
 
 /* type index of a value (const or inst result); 0 if unknown. */
@@ -327,7 +339,9 @@ static void cpu_func(cpu_mod_t *X,const bir_func_t *F){
             const bir_inst_t*I=&X->M->insts[ix];
             if ((I->op==BIR_ALLOCA||I->op==BIR_SHARED_ALLOC) && na<CPU_ALLOCA_MAX){
                 uint32_t pte=(I->type<X->M->num_types)?X->M->types[I->type].inner:0;
-                int sz=(type_size(X,pte)+7)&~7; if(sz<8)sz=8;
+                int sz=type_size(X,pte);
+                if(!sz){ fprintf(stderr,"kath: alloca of a type with no storage size\n"); X->n_errs++; }
+                sz=(sz+7)&~7; if(sz<8)sz=8;
                 off-=sz; X->alloca_off[na++]=off;
             }
         }
@@ -405,6 +419,30 @@ static void cpu_func(cpu_mod_t *X,const bir_func_t *F){
         /* mul-hi: one-operand widening mul (48 F7 /4) puts high 64 in RDX */
         case BIR_UMULHI: load_val(X,X_RAX,I->operands[0]);load_val(X,X_RCX,I->operands[1]);eb(X,0x48);eb(X,0xF7);modrm(X,3,4,X_RCX);st_slot(X,X_RDX,s);break;
 
+        /* ---- Bit counting ---- */
+        case BIR_POPCOUNT: case BIR_CTZ: case BIR_CLZ: case BIR_BREV: {
+            if (int_w(X,val_type_x(X,I->operands[0])) != 32) {
+                fprintf(stderr,"kath: bit counting at a width other than 32 "
+                               "not supported on the x86-64 backend\n");
+                X->n_errs++; break;
+            }
+            load_val(X,X_RAX,I->operands[0]);
+            e32_movrr(X,X_RAX,X_RAX);   /* drop whatever the slot's top half held */
+            if (I->op==BIR_POPCOUNT) x86_popcount(X);
+            else if (I->op==BIR_BREV) x86_brev(X);
+            else if (I->op==BIR_CTZ) {
+                e32_movi(X,X_RCX,32); e32_bsf(X,X_RAX,X_RAX); e32_cmovz(X,X_RAX,X_RCX);
+            } else {
+                /* bsr gives the top set bit, so clz is 31 minus it, and the
+                 * -1 for zero lands on 32. */
+                e32_movi(X,X_RCX,0xFFFFFFFFu);
+                e32_bsr(X,X_RAX,X_RAX); e32_cmovz(X,X_RAX,X_RCX);
+                e32_movi(X,X_RCX,31); e32_sub(X,X_RCX,X_RAX);
+                e32_movrr(X,X_RAX,X_RCX);
+            }
+            st_slot(X,X_RAX,s); break;
+        }
+
         /* ---- integer bitwise (width-agnostic, plain 64-bit) ---- */
         case BIR_AND: load_val(X,X_RAX,I->operands[0]);load_val(X,X_RCX,I->operands[1]);rexw(X,X_RCX,X_RAX);eb(X,0x21);modrm(X,3,X_RCX,X_RAX);st_slot(X,X_RAX,s);break;
         case BIR_OR:  load_val(X,X_RAX,I->operands[0]);load_val(X,X_RCX,I->operands[1]);rexw(X,X_RCX,X_RAX);eb(X,0x09);modrm(X,3,X_RCX,X_RAX);st_slot(X,X_RAX,s);break;
@@ -443,7 +481,9 @@ static void cpu_func(cpu_mod_t *X,const bir_func_t *F){
             else { eb(X,0x31);modrm(X,3,X_RDX,X_RDX); eb(X,0xF7);modrm(X,3,6,X_RCX); }
             if (I->op==BIR_UREM){ rexw(X,X_RDX,X_RAX);eb(X,0x89);modrm(X,3,X_RDX,X_RAX); }
             st_slot(X,X_RAX,s); break; }
-        case BIR_GEP: { int sz=pointee_sz(X,I->type); load_val(X,X_RCX,I->operands[1]); mov_imm(X,X_RAX,sz); eb(X,0x48);eb(X,0x0F);eb(X,0xAF);modrm(X,3,X_RCX,X_RAX); load_val(X,X_RAX,I->operands[0]); rexw(X,X_RCX,X_RAX);eb(X,0x01);modrm(X,3,X_RCX,X_RAX); st_slot(X,X_RAX,s); break; }
+        case BIR_GEP: { int sz=pointee_sz(X,I->type);
+            if(!sz){ fprintf(stderr,"kath: gep through a pointer with no storage size\n"); X->n_errs++; break; }
+            load_val(X,X_RCX,I->operands[1]); mov_imm(X,X_RAX,sz); eb(X,0x48);eb(X,0x0F);eb(X,0xAF);modrm(X,3,X_RCX,X_RAX); load_val(X,X_RAX,I->operands[0]); rexw(X,X_RCX,X_RAX);eb(X,0x01);modrm(X,3,X_RCX,X_RAX); st_slot(X,X_RAX,s); break; }
         case BIR_LOAD: { load_val(X,X_RAX,I->operands[0]); /* addr in rax */
             const bir_type_t *t=(I->type<X->M->num_types)?&X->M->types[I->type]:0;
             int isflt=t&&(t->kind==BIR_TYPE_FLOAT||t->kind==BIR_TYPE_BFLOAT);
@@ -711,6 +751,9 @@ static void cpu_func(cpu_mod_t *X,const bir_func_t *F){
             if (is_float_ty(X,I->type)){ int w64=(I->type<X->M->num_types&&X->M->types[I->type].width==64); st_xmm_slot(X,X_XMM0,s,w64); }
             else st_slot(X,X_RAX,s);
             break; }
+        case BIR_MMA: case BIR_MFRG:
+            fprintf(stderr,"kath: warp-collective mma not supported on the x86-64 backend\n");
+            X->n_errs++; break;
         default: mov_imm(X,X_RAX,0); st_slot(X,X_RAX,s); break;
         }}
     }

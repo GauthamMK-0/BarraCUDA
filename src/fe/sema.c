@@ -615,6 +615,14 @@ static const cuda_builtin_t cuda_builtins[] = {
     {"__shfl_down",     -1, 0,  0},
     {"__shfl_xor",      -1, 0,  0},
     {"__umul64hi",       2, 0,  0},  /* high 64 of a 64x64 product — ZK field arith */
+    {"__popc",           1, 0, -1},  /* the half of ballot that reads the mask */
+    {"__popcll",         1, 0, -1},
+    {"__clz",            1, 0, -1},
+    {"__clzll",          1, 0, -1},
+    {"__ffs",            1, 0, -1},  /* 1-based, 0 for a zero input */
+    {"__ffsll",          1, 0, -1},
+    {"__brev",           1, 0,  0},  /* returns its argument's type, not int */
+    {"__brevll",         1, 0,  0},
     {"sqrtf",1,0,0},{"sqrt",1,0,0},{"__fsqrt_rn",1,0,0},{"rsqrtf",1,0,0},{"__frsqrt_rn",1,0,0},
     {"__frcp_rn",1,0,0},{"expf",1,0,0},{"__expf",1,0,0},{"exp2f",1,0,0},
     {"logf",1,0,0},{"__logf",1,0,0},{"log2f",1,0,0},{"__log2f",1,0,0},
@@ -967,9 +975,10 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
         get_text(S, callee_n, cname, sizeof(cname));
 
         uint32_t arg_types[BC_MAX_ARGS];
-        int nargs = 0;
+        int nargs = 0, argvar = 0;
         uint32_t arg = ND(S, callee_n)->next_sibling;
         while (arg && nargs < BC_MAX_ARGS) {
+            if (ND(S, arg)->type == AST_PACK_EXP) argvar = 1;
             arg_types[nargs++] = check_expr(S, arg);
             arg = ND(S, arg)->next_sibling;
         }
@@ -1025,7 +1034,7 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
                 if (strcmp(cname, vec_ctors[vi].name) == 0) {
                     uint32_t elem_t = intern_type(S, vec_ctors[vi].elem, 0, 0, 0, 0);
                     uint32_t vt = intern_type(S, STYPE_VECTOR, 0, vec_ctors[vi].lanes, elem_t, 0);
-                    if (nargs != (int)vec_ctors[vi].lanes)
+                    if (nargs != (int)vec_ctors[vi].lanes && !argvar)
                         sema_error(S, node, BC_E073,
                                    cname, (int)vec_ctors[vi].lanes, nargs);
                     return annotate(S, node, vt);
@@ -1069,6 +1078,20 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
             return annotate(S, node, st_int(S));
         }
 
+        /* ---- Warp-collective 16x16x16 f16 matrix multiply ---- */
+        if (strncmp(cname, "__builtin_mma_m16n16k", 21) == 0) {
+            if (nargs != 6)
+                sema_error(S, node, BC_E075, cname, nargs);
+            return annotate(S, node, st_void(S));
+        }
+
+        /* ---- MFMA over per-lane fragments in memory ---- */
+        if (strncmp(cname, "__builtin_mfma_", 15) == 0) {
+            if (nargs != 3)
+                sema_error(S, node, BC_E075, cname, nargs);
+            return annotate(S, node, st_void(S));
+        }
+
         /* ---- MFMA intrinsics (CDNA matrix ops) ---- */
         if (strncmp(cname, "__builtin_amdgcn_mfma_", 22) == 0) {
             if (nargs != 3)
@@ -1082,7 +1105,7 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
             if (strcmp(cname, cuda_builtins[i].name) != 0) continue;
             const cuda_builtin_t *b = &cuda_builtins[i];
 
-            if (b->nargs >= 0 && nargs != b->nargs) {
+            if (b->nargs >= 0 && nargs != b->nargs && !argvar) {
                 sema_error(S, node, BC_E073,
                            cname, b->nargs, nargs);
             }
@@ -1116,7 +1139,7 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
             uint32_t ft = sym->type;
             if (ft < S->num_types && S->types[ft].kind == STYPE_FUNC) {
                 int expected = (int)S->types[ft].width;
-                if (expected > 0 && nargs != expected) {
+                if (expected > 0 && nargs != expected && !argvar) {
                     sema_error(S, node, BC_E073,
                                cname, expected, nargs);
                 }
@@ -1170,6 +1193,28 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
 
     case AST_TEMPLATE_ARGS: {
         return annotate(S, node, st_void(S));
+    }
+
+    case AST_PACK_SIZE:
+        return annotate(S, node, st_ulong(S));
+
+    case AST_PACK_EXP: {
+        uint32_t pat = n->first_child;
+        return annotate(S, node, pat ? check_expr(S, pat) : st_void(S));
+    }
+
+    case AST_FOLD: {
+        uint32_t e = n->first_child;
+        uint32_t t = st_void(S);
+        while (e) { t = check_expr(S, e); e = ND(S, e)->next_sibling; }
+        switch (n->d.oper.op) {
+        case TOK_LAND: case TOK_LOR:
+        case TOK_EQ: case TOK_NE: case TOK_LT:
+        case TOK_GT: case TOK_LE: case TOK_GE:
+            return annotate(S, node, st_bool(S));
+        default:
+            return annotate(S, node, t);
+        }
     }
 
     default:
@@ -1496,7 +1541,8 @@ static void collect_func_decl(sema_ctx_t *S, uint32_t node)
     int nparams = 0;
     uint32_t c = ND(S, node)->first_child;
     while (c) {
-        if (ND(S, c)->type == AST_PARAM && nparams < 32) {
+        if (ND(S, c)->type == AST_PARAM && nparams < 32
+            && ND(S, c)->d.oper.op != PRM_VARG) {
             uint32_t pt_n = ND(S, c)->first_child;
             int pdepth = ND(S, c)->d.oper.flags;
             param_types[nparams++] = resolve_typespec(S, pt_n, pdepth);
@@ -1564,7 +1610,8 @@ static void check_func_def(sema_ctx_t *S, uint32_t node)
 
     uint32_t c = ND(S, node)->first_child;
     while (c) {
-        if (ND(S, c)->type == AST_PARAM) {
+        if (ND(S, c)->type == AST_PARAM
+            && ND(S, c)->d.oper.op != PRM_VARG) {
             uint32_t pt_n = ND(S, c)->first_child;
             int pdepth = ND(S, c)->d.oper.flags;
             uint32_t pt = resolve_typespec(S, pt_n, pdepth);

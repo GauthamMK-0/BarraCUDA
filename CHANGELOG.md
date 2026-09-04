@@ -1,9 +1,36 @@
 Booth — Changelog
 =================
 
-## Unreleased
+## Booth 0.5.3
+
+### Runtime
+
+- #169: the runtime is split by where it runs, the `BC_ERR_*` codes no
+  longer collide, and the examples and NVIDIA harness are built
+  (Zane Hambly, 2026-08-23)
+
 
 ### Frontend
+
+- variadic template parameter packs, several `.cu` files as separate
+  translation units, `mma.sync` and `mfma` lowering, and an i1 that no
+  longer strides by zero (Zane Hambly, 2026-09-03)
+
+- `(a) + (b)` adds again; the parser treated any parenthesised identifier as a
+  type name without asking whether it named one, so the left operand vanished
+  into a cast with no diagnostic (Zane Hambly, 2026-09-03)
+
+- the cast test is now the type name registry, so the registry has to be
+  complete. Template type parameters, `using X = T` aliases and the type names
+  sema resolves without a typedef (`size_t`, `uint32_t`, `float4` and the rest)
+  all reach it. A compound literal through a typedef, `(pair){1, 2}`, parses
+  for the first time, and `sizeof(name)` where the name is a type reads as a
+  type rather than an expression (Zane Hambly, 2026-09-03)
+
+- llama.cpp's ggml-cuda preprocesses, all 67 files; `#pragma once` is
+  honoured, variadic and multi-line macro invocations expand, and an
+  expansion too big for the output buffer is E053 rather than an
+  unterminated buffer the lexer reads past (Zane Hambly, 2026-09-03)
 
 - `kath --mlir` reads MLIR text, no LLVM in the path. Čertík's pure-C
   reader vendored under `src/mlir/vendor` (mlir 826b69c9, corec a160199d),
@@ -43,7 +70,44 @@ Booth — Changelog
   a loop kernel were labelled with the kernel's own name
   (Zane Hambly, 2026-08-11)
 
+- `kath --bir-in` reads BIR text and skips the frontend entirely, so a compiler
+  outside this tree can target Booth without linking against it. `src/build/`
+  parses and builds modules, `src/ocaml/` emits them from OCaml, and `kcomp`
+  lowers an ordinary OCaml function from its .cmt, leaving ocamlc to do the
+  type checking and refusing anything outside the kernel subset by source
+  location. Immediates parse as well as print, so a module holding a constant
+  reads back. The PTX from an OCaml-written vadd runs on an RTX 4060 Ti
+  (Zane Hambly, 2026-08-18)
+
+- The kernel language grows device functions, shared memory, loops, division
+  and the transcendentals, enough to price an Asian option on the GPU, which
+  turned up four bugs now fixed: sin and cos took turns rather than radians,
+  float constants printed to six digits, the BIR lexer clamped integers above
+  INT32_MAX because long is 32 bits on Windows, and a function's total_insts
+  was the module count rather than its own, so mem2reg moved one body over the
+  next (Zane Hambly, 2026-08-18)
+
+- The Asian pricer takes its model parameters as arguments and reduces across
+  the block on device (Zane Hambly, 2026-08-18)
+
+- `get`, `set`, `sget` and `sset` take the element type from the array rather
+  than assuming f32, so an integer array is usable and not merely declarable
+  (Zane Hambly, 2026-08-18)
+
+- Atomic add, sub, and, or, xor and xchg reach the kernel language, leaving min
+  and max out while BIR has one opcode for each and NVIDIA reads it unsigned
+  where AMD reads it signed (Zane Hambly, 2026-08-18)
+
+### Documentation
+
+- How to write and build an OCaml kernel, what the subset holds and what it
+  does not, and OCaml and LFortran named as the optional dependencies they are
+  (Zane Hambly, 2026-08-18)
+
 ### Architecture
+
+- A run-side contract in `src/exec`, a variant flag with no target now errors,
+  and `parse_type` no longer recurses off the stack (Zane Hambly, 2026-08-18)
 
 - BIR arena writers record a `pool_full` bit rather than returning index 0,
   which is a live entry and not a sentinel. A full pool emitted wrong
@@ -53,6 +117,16 @@ Booth — Changelog
   with them, so every line number past the first deleted instruction
   pointed at the wrong source. Four sites fixed
   (Zane Hambly, 2026-08-09)
+
+### Backends
+
+- `__popc`, `__clz`, `__ffs` and `__brev`, and the BIR ops behind them (#165).
+  Both scans answer the operand's width for a zero input. AMD uses
+  `v_bcnt_u32_b32` and the ffbl/ffbh pair, PTX the native popc/clz/brev, and
+  x86-64, RV64 and the Tensix baby cores a SWAR through the multiplier rather
+  than `popcnt`/`tzcnt`, which are SSE4.2 and BMI1. Widths other than 32 are
+  refused by name; `n_errs` was a field nobody read, so both CPU backends were
+  printing a refusal and writing the object anyway (Zane Hambly, 2026-08-18)
 
 ### Build
 

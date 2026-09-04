@@ -1,4 +1,7 @@
-# Booth
+<div align="center">
+  <img src="Booth_logo.png" alt="Booth logo" width="400">
+  <h1>Booth</h1>
+</div>
 
 **Booth** is an open-source CUDA, HIP and Triton compiler targeting multiple GPU architectures, either natively by emitting machine code or as close as we can possibly get. Now with distinctly less fish.
 
@@ -6,10 +9,11 @@ It is named to honour Kathleen Booth: creator of the first assembly language, co
 
 A running log of what's changed is in [CHANGELOG.md](CHANGELOG.md).
 
-**Update:** `--mlir` reads MLIR text, with no LLVM anywhere in the path.
-`func.func` and the `arith` dialect lower to BIR and go down the same pipeline
-CUDA and Triton use. It is a small subset on purpose, and anything outside it
-is named and refused rather than skipped. See [Using MLIR](docs/usage.md#mlir).
+**Update:** GPU kernels can be written as ordinary OCaml functions. `ocamlc`
+does the type checking, so writing an `int` where a 32-bit device integer
+belongs, or reading a block-shared array as if it were global, fails before
+Booth sees it. An Asian option pricer written this way runs on an RTX 4060 Ti
+and agrees with its closed-form reference. See [Using OCaml](docs/usage.md#ocaml).
 
 ## What It Does
 
@@ -20,6 +24,9 @@ That last one still surprises me a bit. You can write a Triton kernel, matmul an
 Fortran `do concurrent` kernels go down the same path through
 [LFortran](https://lfortran.org/), checked against SLATEC values in CI. See
 [Using Fortran](docs/usage.md#fortran).
+
+OCaml kernels go down it too, written as plain functions and type-checked by
+`ocamlc` before Booth reads the `.cmt`. See [Using OCaml](docs/usage.md#ocaml).
 
 It also borrows a pile of operational discipline from the mainframe world: real crash dumps when a kernel faults, structured output routed by class, parameter snapshots on entry. See [docs/mainframe.md](docs/mainframe.md) if that sounds like your kind of thing.
 
@@ -41,7 +48,16 @@ If you'd rather build it, or you're on something I don't ship a binary for:
 make
 ```
 
-That's the whole thing. You need a C99 compiler (gcc, clang, whatever you've got) and nothing else. 
+That's the whole thing. You need a C99 compiler (gcc, clang, whatever you've got) and nothing else.
+
+Two frontends read what another compiler produced, so you only need that
+compiler if you want that frontend. Neither is needed to build Booth:
+
+- Fortran kernels want [LFortran](https://lfortran.org/), which emits the CUDA
+  source Booth compiles the rest of the way.
+- OCaml kernels want [OCaml](https://ocaml.org/) 5.x and dune, which type-check
+  the kernel and leave the `.cmt` Booth reads.
+
 
 ```bash
 # compile a CUDA kernel to an AMD GPU binary
@@ -90,6 +106,7 @@ Based in New Zealand, where it's already tomorrow and the GPUs are just as confu
 - **Low Level** for the Zero to Hero C course and the YouTube channel. That's where I learnt C.
 - **Abe Kornelis** for being an amazing teacher. His work on the [z390 Portable Mainframe Assembler](https://github.com/z390development/z390) project is well worth your time.
 - To the people who've sent messages of kindness and critique, thank you from a forever student and a happy hobbyist.
+- **Lola**, my sister, for the logo :-)
 - My Granny, Grandad, Nana and Baka. Love you x
 
 *He aha te mea nui o te ao. He tāngata, he tāngata, he tāngata.*
