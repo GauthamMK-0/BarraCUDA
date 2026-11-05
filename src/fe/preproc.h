@@ -13,13 +13,15 @@
 
 
 #define PP_MAX_MACROS       2048
-#define PP_MAX_PARAMS       16
+#define PP_MAX_PARAMS       32
+#define PP_MAX_ARGS         128
 #define PP_MAX_INCLUDE_PATHS 32
 #define PP_MAX_COND_DEPTH   64
 #define PP_MAX_FILE_DEPTH   16
 #define PP_MAX_EXPAND_DEPTH 32
 #define PP_MAX_ONCE         256
 #define PP_MAX_JOIN         256
+#define PP_MAX_MISS         64
 #define PP_POOL_SIZE        (256 * 1024)   /* 256KB for macro names + bodies */
 #define PP_LINE_BUF         (64 * 1024)    /* 64KB max logical line */
 #define PP_EXPAND_BUF       (128 * 1024)   /* 128KB expansion workspace */
@@ -101,14 +103,21 @@ typedef struct {
      * truncated buffer is not a smaller program, it is a broken one. */
     int         ovflw;
 
+    int         keepinc;
+
+    char        miss[PP_MAX_MISS][BC_MAX_PATH];
+    uint32_t    nmiss;
+
     /* Errors */
     bc_error_t  errors[BC_MAX_ERRORS];
     int         num_errors;
+    int         nhard;
 } preproc_t;
 
 void pp_init(preproc_t *pp, const char *src, uint32_t len,
              char *out_buf, uint32_t out_max, const char *filename);
 
+void pp_host(preproc_t *pp);
 int  pp_add_include_path(preproc_t *pp, const char *path);
 int  pp_define(preproc_t *pp, const char *name, const char *value);
 int  pp_process(preproc_t *pp);

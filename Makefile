@@ -23,7 +23,7 @@ CFLAGS  = -std=c99 -MMD -MP -Wall -Wextra -pedantic -O2 \
           -Wdouble-promotion -Wswitch-enum -Wwrite-strings \
           -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE $(CF_PROT) \
           $(GCC_ONLY) \
-          -Isrc -Isrc/fe -Isrc/ir -Isrc/tdf -Isrc/backend -Isrc/amdgpu -Isrc/tensix -Isrc/nvidia -Isrc/metal -Isrc/intel -Isrc/triton -Isrc/cpu -Isrc/build -Iruntime/include \
+          -Isrc -Isrc/fe -Isrc/ir -Isrc/tdf -Isrc/backend -Isrc/amdgpu -Isrc/tensix -Isrc/nvidia -Isrc/metal -Isrc/intel -Isrc/triton -Isrc/cpu -Isrc/build -Isrc/exec -Isrc/host -Iruntime/include \
           $(COVFLAGS)
 LDFLAGS = -pie
 LIBS    = -lm
@@ -71,55 +71,16 @@ SOURCES = src/main.c src/kauri_impl.c \
           src/amdgpu/amd_rplan.c src/amdgpu/isel.c src/amdgpu/emit.c src/amdgpu/ra_ssa.c src/amdgpu/encode.c src/amdgpu/enc_tab.c src/amdgpu/sched.c src/amdgpu/verify.c src/amdgpu/amd_be.c \
           src/tensix/isel.c src/tensix/emit.c src/tensix/coarsen.c src/tensix/datamov.c src/tensix/noc.c \
           src/tensix/rv_enc.c src/tensix/rv_buf.c src/tensix/rv_elf.c src/tensix/rv_isel.c src/tensix/tensix_be.c src/cpu/cpu_emit.c src/cpu/cpu_elf.c src/cpu/rv64_emit.c src/cpu/rv64_elf.c src/cpu/cpu_be.c \
-          src/nvidia/isel.c src/nvidia/emit.c src/nvidia/nv_be.c \
+          src/nvidia/isel.c src/nvidia/emit.c src/nvidia/nv_be.c src/nvidia/emit_sass.c src/nvidia/verify.c \
+          src/nvidia/lt_nvi.c src/nvidia/lt_nv.c src/nvidia/lt_nvcf.c src/nvidia/nv_note.c \
           src/metal/emit.c src/metal/metal_be.c \
           src/intel/emit.c src/intel/intel_be.c \
           src/triton/lex.c src/triton/parse.c src/triton/sema.c src/triton/lower.c \
-          src/mlir/mlir_fe.c src/mlir/lower.c
+          src/exec/execs.c src/exec/cpu_exec.c src/exec/booth_run.c src/exec/verbs.c \
+          src/host/hgen.c \
+          runtime/host/cuda/nv_rt.c runtime/host/cuda/nv_exec.c
 
-# Certik's pure-C MLIR reader, vendored under src/mlir/vendor. It carries his
-# corec base library and a syscall shim per host, so only one of the three
-# platform files is ever built.
-#
-# c2x rather than c99 because corec's format.h dispatches on _Generic and
-# needs __VA_OPT__, and the ~100 format() call sites through it are not worth
-# rewriting. -Wno-switch-enum because these switch over a 140-value op enum
-# with a default label and upstream keeps adding ops. Nothing else in the
-# warning set is relaxed. PLATFORM_SKIP_ENTRY leaves main to Booth,
-# COREC_STDLIB_PROVIDES_MEM stops corec defining memcpy and memset when a real
-# libc is already doing it.
-VDIR = src/mlir/vendor
-VPLAT = platform_windows.c
-ifeq ($(UNAME_S),Linux)
-  VPLAT = platform_linux.c
-endif
-ifeq ($(UNAME_S),Darwin)
-  VPLAT = platform_macos.c
-endif
-VSOURCES = $(VDIR)/tokenizer.c $(VDIR)/mlir_parser.c $(VDIR)/op_parsers.c \
-           $(VDIR)/mlir_api_impl.c $(VDIR)/mlir_op_names.c \
-           $(VDIR)/mlir_classic_printer.c $(VDIR)/mlir_lift_cf_to_scf.c \
-           $(VDIR)/base/io.c $(VDIR)/base/buddy.c $(VDIR)/base/arena.c \
-           $(VDIR)/base/scratch.c $(VDIR)/base/format.c $(VDIR)/base/math.c \
-           $(VDIR)/base/string.c $(VDIR)/base/strbuf.c $(VDIR)/base/mem.c \
-           $(VDIR)/base/numconv.c $(VDIR)/base/assert.c $(VDIR)/base/exit.c \
-           $(VDIR)/platform/$(VPLAT)
-# Simply expanded, so the target-specific assignment below is a plain string
-# rather than something that re-expands CFLAGS into itself.
-VCFLAGS := $(subst -std=c99,-std=c2x,$(CFLAGS)) -Wno-switch-enum \
-           -DPLATFORM_SKIP_ENTRY -DCOREC_STDLIB_PROVIDES_MEM -I$(VDIR)
-
-OBJECTS = $(SOURCES:%.c=$(OBJDIR)/%.o) $(VSOURCES:%.c=$(OBJDIR)/%.o)
-
-# Everything under src/mlir compiles on VCFLAGS, vendored or not. mlir_fe.c and
-# lower.c are ours but they speak corec types, so they want the same flags.
-# A target-specific variable rather than a pattern rule, because two patterns
-# match these objects and make 3.81, which is what macOS ships, does not
-# resolve that the way make 4 does. It took the generic rule and the build lost
-# its include path.
-MLOBJECTS = $(VSOURCES:%.c=$(OBJDIR)/%.o) \
-            $(OBJDIR)/src/mlir/mlir_fe.o $(OBJDIR)/src/mlir/lower.o
-$(MLOBJECTS): CFLAGS := $(VCFLAGS)
+OBJECTS = $(SOURCES:%.c=$(OBJDIR)/%.o)
 TARGET  = kath
 
 # Host programs that link a vendor driver at run time: the examples and the
@@ -127,12 +88,11 @@ TARGET  = kath
 # strict flags without libhsa or libcuda having to be present. Neither is a
 # trunner test; both carry their own main and want real hardware.
 EXAMPLE_SRC = $(wildcard examples/*.c)
-HOSTCHK     = $(OBJDIR)/tests/tnv_rt.o $(OBJDIR)/tests/tnv_i1.o $(OBJDIR)/tests/tnv_bstr.o $(OBJDIR)/tests/gpu_mma.o $(patsubst examples/%.c,$(OBJDIR)/examples/%.o,$(EXAMPLE_SRC))
-
+HOSTCHK     = $(OBJDIR)/tests/tnv_rt.o $(OBJDIR)/tests/tnv_sass.o $(OBJDIR)/tests/tnv_i1.o $(OBJDIR)/tests/tnv_bstr.o $(OBJDIR)/tests/tnv_sret.o $(OBJDIR)/tests/tnv_call.o $(OBJDIR)/tests/tnv_grid.o $(OBJDIR)/tests/gpu_tid.o $(OBJDIR)/tests/gpu_mma.o $(OBJDIR)/tests/gpu_wmma.o $(OBJDIR)/tests/gpu_hcvt.o $(patsubst examples/%.c,$(OBJDIR)/examples/%.o,$(EXAMPLE_SRC))
 all: $(TARGET) $(ALT_RT) $(HOSTCHK)
 
 $(TARGET): $(OBJECTS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS) $(DL_LIB)
 
 $(OBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -140,9 +100,10 @@ $(OBJDIR)/%.o: %.c
 
 # ---- Test Suite ----
 TCFLAGS = -std=c99 -MMD -MP -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O0 -g \
-          -Isrc -Isrc/fe -Isrc/ir -Isrc/tdf -Isrc/backend -Isrc/amdgpu -Isrc/tensix -Isrc/nvidia -Isrc/metal -Isrc/intel -Isrc/triton -Isrc/cpu -Isrc/build \
-          -Isrc/mlir -Iruntime/include $(COVFLAGS)
+          -Isrc -Isrc/fe -Isrc/ir -Isrc/tdf -Isrc/backend -Isrc/amdgpu -Isrc/tensix -Isrc/nvidia -Isrc/metal -Isrc/intel -Isrc/triton -Isrc/cpu -Isrc/build -Isrc/exec \
+          -Iruntime/include $(COVFLAGS)
 TSRC    = tests/tmain.c tests/tsmoke.c tests/tcomp.c tests/tenc.c \
+          tests/tasy.c \
           tests/ttabs.c tests/ttypes.c tests/terrs.c tests/tphase.c \
           tests/tdce.c \
           tests/tcfold.c \
@@ -167,11 +128,15 @@ TSRC    = tests/tmain.c tests/tsmoke.c tests/tcomp.c tests/tenc.c \
           tests/tbackend.c \
           tests/tordr.c \
           tests/trpi.c \
-          tests/tmlir.c \
           tests/tbir.c \
           tests/tocm.c \
           tests/tpack.c \
-          tests/tmtu.c
+          tests/tmtu.c \
+          tests/tcxp.c \
+          tests/ttpl.c \
+          tests/tvec.c \
+          tests/tref.c tests/ttyc.c tests/tcpp.c \
+          tests/tmof.c tests/tasm.c tests/thost.c
 
 TOBJS   = $(TSRC:%.c=$(OBJDIR)/%.o)
 COBJS   = $(OBJDIR)/src/kauri_impl.o $(OBJDIR)/src/ir/bir.o $(OBJDIR)/src/ir/bir_print.o $(OBJDIR)/src/ir/bir_lower.o $(OBJDIR)/src/ir/bir_mem2reg.o $(OBJDIR)/src/ir/bir_cfold.o $(OBJDIR)/src/ir/bir_dce.o $(OBJDIR)/src/ir/bir_struct.o $(OBJDIR)/src/ir/bir_insert.o $(OBJDIR)/src/ir/bir_sroa.o $(OBJDIR)/src/ir/bir_inline.o \
@@ -182,17 +147,22 @@ COBJS   = $(OBJDIR)/src/kauri_impl.o $(OBJDIR)/src/ir/bir.o $(OBJDIR)/src/ir/bir
           $(OBJDIR)/src/fe/bc_err.o $(OBJDIR)/src/fe/lexer.o $(OBJDIR)/src/fe/parser.o $(OBJDIR)/src/fe/preproc.o $(OBJDIR)/src/fe/sema.o \
           $(OBJDIR)/runtime/host/bc_abend.o $(HOSTRT) \
           $(OBJDIR)/src/backend/backends.o \
+          $(OBJDIR)/src/host/hgen.o \
           $(OBJDIR)/src/amdgpu/amd_be.o $(OBJDIR)/src/nvidia/nv_be.o \
           $(OBJDIR)/src/tensix/tensix_be.o $(OBJDIR)/src/cpu/cpu_be.o \
           $(OBJDIR)/src/metal/metal_be.o $(OBJDIR)/src/intel/intel_be.o \
-          $(OBJDIR)/src/nvidia/isel.o $(OBJDIR)/src/nvidia/emit.o \
+          $(OBJDIR)/src/nvidia/isel.o $(OBJDIR)/src/nvidia/emit.o $(OBJDIR)/src/nvidia/emit_sass.o $(OBJDIR)/src/nvidia/verify.o \
+          $(OBJDIR)/src/nvidia/lt_nvi.o $(OBJDIR)/src/nvidia/lt_nv.o $(OBJDIR)/src/nvidia/lt_nvcf.o $(OBJDIR)/src/nvidia/nv_note.o \
           $(OBJDIR)/src/cpu/cpu_emit.o $(OBJDIR)/src/cpu/cpu_elf.o \
           $(OBJDIR)/src/cpu/rv64_emit.o $(OBJDIR)/src/cpu/rv64_elf.o \
           $(OBJDIR)/src/tensix/isel.o $(OBJDIR)/src/tensix/coarsen.o $(OBJDIR)/src/tensix/datamov.o \
-          $(OBJDIR)/src/metal/emit.o $(OBJDIR)/src/intel/emit.o \
-          $(OBJDIR)/src/mlir/mlir_fe.o $(OBJDIR)/src/mlir/lower.o $(VSOURCES:%.c=$(OBJDIR)/%.o)
+          $(OBJDIR)/src/metal/emit.o $(OBJDIR)/src/intel/emit.o
+
+rules:
+	@sh tests/rules.sh
 
 test: $(TARGET) trunner
+	@sh tests/rules.sh
 	./trunner --all
 
 # bir.h claims a deterministic layout. This makes that a property rather
@@ -298,11 +268,8 @@ coverage:
 	-./trunner --all
 	@command -v gcovr >/dev/null 2>&1 || { echo "gcovr not found. pip install gcovr"; exit 1; }
 	@mkdir -p coverage-html
-	@# gcovr snuffles through the object dir like a skaven after warp tokens, so vendored data has to be gone rather than filtered.
-	find $(COVDIR)/src/mlir \( -name '*.gcda' -o -name '*.gcno' \) -delete 2>/dev/null || true
 	gcovr --root . --object-directory $(COVDIR) \
 	      --filter 'src/' --filter 'runtime/' \
-	      --exclude 'src/mlir/vendor/' \
 	      --exclude-unreachable-branches \
 	      --print-summary --txt coverage.txt --html-details coverage-html/index.html
 	rm -f $(TARGET) $(TARGET).exe trunner trunner.exe
@@ -310,7 +277,7 @@ coverage:
 
 clean:
 	rm -rf $(OBJDIR) $(COVDIR)
-	rm -f $(TARGET) $(TARGET).exe trunner trunner.exe tnv_rt tnv_rt.exe
+	rm -f $(TARGET) $(TARGET).exe trunner trunner.exe tnv_rt tnv_rt.exe tnv_sass tnv_sass.exe
 	rm -rf coverage.txt coverage-html
 	rm -f *.hsaco *.ptx *.spv *.metal *.elf *.bin *.ttinsn *.o
 	rm -f *_host.cpp *_reader.cpp *_writer.cpp *_compute.cpp
@@ -320,4 +287,4 @@ clean:
 # linked in and the build silently disagrees with the source.
 -include $(OBJECTS:.o=.d) $(TOBJS:.o=.d) $(HOSTRT:.o=.d)
 
-.PHONY: all clean test repro mutate mutate-discover install uninstall coverage hostchk
+.PHONY: all clean test rules repro mutate mutate-discover install uninstall coverage hostchk

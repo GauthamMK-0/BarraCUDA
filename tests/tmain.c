@@ -83,6 +83,14 @@ static const tfam_t fam_order[] = {
     { "typ", "ttypes.c",    "type table",               2 },
     { "tab", "ttabs.c",     "static tables",            2 },
     { "pck", "tpack.c",     "parameter packs",          2 },
+    { "cxp", "tcxp.c",      "constexpr objects",        2 },
+    { "tpl", "ttpl.c",      "class templates",          2 },
+    { "vec", "tvec.c",      "CUDA vector types",        2 },
+    { "ref", "tref.c",      "reference parameters",     2 },
+    { "mof", "tmof.c",      "struct member offsets",    2 },
+    { "tyc", "ttyc.c",      "types and coercion",       2 },
+    { "cpp", "tcpp.c",      "host C++ in a .cu",        2 },
+    { "asm", "tasm.c",      "inline asm and frame layout", 2 },
 
     { "dce", "tdce.c",      "dead code elimination",    2 },
     { "cfd", "tcfold.c",    "constant folding",         2 },
@@ -92,6 +100,7 @@ static const tfam_t fam_order[] = {
     { "inl", "tinline.c",   "inlining",                 2 },
 
     { "enc", "tenc.c",      "AMD encoding",             2 },
+    { "asy", "tasy.c",      "AMD encoding assay",       2 },
     { "sch", "tsched.c",    "AMD scheduling",           2 },
     { "ral", "tregalloc.c", "AMD register allocation",  2 },
     { "rss", "tra_ssa.c",   "AMD SSA allocation",       2 },
@@ -107,7 +116,6 @@ static const tfam_t fam_order[] = {
 
     { "tri", "ttriton.c",   "Triton frontend",          2 },
     { "mma", "tmma.c",      "warp matrix multiply",     2 },
-    { "mlr", "tmlir.c",     "MLIR reader",              2 },
     { "bir", "tbir.c",      "BIR text frontend",        2 },
 
     { "sfp", "tsoft_fp.c",  "soft float",               2 },
@@ -117,6 +125,7 @@ static const tfam_t fam_order[] = {
     { "bkd", "tbackend.c",  "backend registry",         2 },
     { "cmp", "tcomp.c",     "compile matrix",           2 },
     { "wsz", "twarpsize.c", "warp size",                2 },
+    { "hst", "thost.c",     "host side",                2 },
 
     { "ord", "tordr.c",     "harness ordering",         2 },
     { "ocm", "tocm.c",      "OCaml frontend",           2 },

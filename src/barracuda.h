@@ -14,15 +14,18 @@
  * compiler look four major versions further along than it is. Corrected here;
  * everything downstream derives from these three numbers. */
 #define BC_VERSION_MAJOR    0
-#define BC_VERSION_MINOR    5
-#define BC_VERSION_PATCH    3
-#define BC_VERSION_STRING   "0.5.3"
+#define BC_VERSION_MINOR    6
+#define BC_VERSION_PATCH    1
+#define BC_VERSION_STRING   "0.6.1"
 
 /* The universe has limits. So do our buffers. No malloc, no madness. */
 #define BC_MAX_SOURCE       (4 * 1024 * 1024)
 #define BC_MAX_TOKENS       (1 << 20)
 #define BC_MAX_IDENT        256
 #define BC_MAX_ERRORS       64
+#define BC_MAX_TMPLS        256
+#define BC_MAX_TNAMES       1024
+#define BC_MAX_BTNAMS       96
 /* Arguments in one call. Real ocean kernels pass 23, so 16 was not enough. */
 #define BC_MAX_ARGS         64
 #define BC_MAX_PATH         512
@@ -68,7 +71,11 @@ typedef struct {
     char     msg[256];
     int      code;
     uint16_t eid;      /* bc_eid_t — language-neutral error ID */
+    uint8_t  sev;
 } bc_error_t;
+
+#define BC_SEV_ERR  0u
+#define BC_SEV_WARN 1u
 
 #include "fe/bc_err.h"
 

@@ -9,11 +9,11 @@ It is named to honour Kathleen Booth: creator of the first assembly language, co
 
 A running log of what's changed is in [CHANGELOG.md](CHANGELOG.md).
 
-**Update:** GPU kernels can be written as ordinary OCaml functions. `ocamlc`
-does the type checking, so writing an `int` where a 32-bit device integer
-belongs, or reading a block-shared array as if it were global, fails before
-Booth sees it. An Asian option pricer written this way runs on an RTX 4060 Ti
-and agrees with its closed-form reference. See [Using OCaml](docs/usage.md#ocaml).
+**Update:** ggml-cuda, the CUDA half of llama.cpp, now lowers. All 67 of its
+files reach Booth's IR, and 47 of its kernels go through the new native SASS
+backend, which writes a cubin the card loads directly. Until now NVIDIA meant
+PTX and the driver's JIT. Try it with `kath --nvidia-cubin`. And I never want
+to have to read a machine dump ever again, lmao omg it's been rough.
 
 ## What It Does
 
@@ -62,6 +62,12 @@ compiler if you want that frontend. Neither is needed to build Booth:
 ```bash
 # compile a CUDA kernel to an AMD GPU binary
 ./kath --amdgpu-bin kernel.cu -o kernel.hsaco
+
+# or compile and run it on whatever device you have, in one command
+./kath run kernel.cu
+
+# see what your machine can do, then self-test it
+./kath doctor
 ```
 
 The binary is `kath` (after Kathleen but if she picked Australia or New Zealand instead of Canada), not `booth`: there's already a `booth` in the Linux HA stack, so you'll likely end up with both on your PATH. The full command reference, every backend and flag, lives in [docs/usage.md](docs/usage.md).
